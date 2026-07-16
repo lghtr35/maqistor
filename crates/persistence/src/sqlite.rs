@@ -12,6 +12,9 @@ use crate::JobStore;
 const SCHEMA_VERSION: i32 = 1;
 const CHANNEL_CAPACITY: usize = 1024;
 const DEFAULT_BATCH_SIZE: usize = 64;
+const DEFAULT_BATCH_SIZE_MIN: usize = 8;
+const DEFAULT_BATCH_SIZE_MAX: usize = 256;
+const DEFAULT_BATCH_SIZE_INCREASE: usize = 2;
 const DEFAULT_BATCH_WAIT_MS: u64 = 5;
 const DEFAULT_BATCH_WAIT_MIN_MS: u64 = 1;
 const DEFAULT_BATCH_WAIT_MAX_MS: u64 = 100;
@@ -19,6 +22,10 @@ const DEFAULT_BATCH_WAIT_MAX_MS: u64 = 100;
 #[derive(Debug, Clone)]
 pub struct SqliteWriteOptions {
     pub batch_size: usize,
+    pub adaptive_batch_size: bool,
+    pub batch_size_min: usize,
+    pub batch_size_max: usize,
+    pub batch_size_increase: usize,
     pub adaptive_batch_wait: bool,
     pub batch_wait: Duration,
     pub batch_wait_min: Duration,
@@ -29,6 +36,10 @@ impl Default for SqliteWriteOptions {
     fn default() -> Self {
         Self {
             batch_size: DEFAULT_BATCH_SIZE,
+            adaptive_batch_size: false,
+            batch_size_min: DEFAULT_BATCH_SIZE_MIN,
+            batch_size_max: DEFAULT_BATCH_SIZE_MAX,
+            batch_size_increase: DEFAULT_BATCH_SIZE_INCREASE,
             adaptive_batch_wait: false,
             batch_wait: Duration::from_millis(DEFAULT_BATCH_WAIT_MS),
             batch_wait_min: Duration::from_millis(DEFAULT_BATCH_WAIT_MIN_MS),
@@ -39,8 +50,13 @@ impl Default for SqliteWriteOptions {
 
 impl SqliteWriteOptions {
     pub fn fixed(batch_size: usize, batch_wait: Duration) -> Self {
+        let batch_size = batch_size.max(1);
         Self {
-            batch_size: batch_size.max(1),
+            batch_size,
+            adaptive_batch_size: false,
+            batch_size_min: batch_size,
+            batch_size_max: batch_size,
+            batch_size_increase: DEFAULT_BATCH_SIZE_INCREASE,
             adaptive_batch_wait: false,
             batch_wait,
             batch_wait_min: batch_wait,
@@ -48,15 +64,20 @@ impl SqliteWriteOptions {
         }
     }
 
+    /// Adaptive batch wait; fixed batch size.
     pub fn adaptive(
         batch_size: usize,
         batch_wait_min: Duration,
         batch_wait_max: Duration,
     ) -> Self {
-        let batch_wait_min = batch_wait_min;
+        let batch_size = batch_size.max(1);
         let batch_wait_max = batch_wait_max.max(batch_wait_min);
         Self {
-            batch_size: batch_size.max(1),
+            batch_size,
+            adaptive_batch_size: false,
+            batch_size_min: batch_size,
+            batch_size_max: batch_size,
+            batch_size_increase: DEFAULT_BATCH_SIZE_INCREASE,
             adaptive_batch_wait: true,
             batch_wait: batch_wait_min,
             batch_wait_min,
@@ -69,6 +90,15 @@ impl SqliteWriteOptions {
             self.batch_wait_min
         } else {
             self.batch_wait
+        }
+    }
+
+    fn initial_live_batch_size(&self) -> usize {
+        let size = self.batch_size.max(1);
+        if self.adaptive_batch_size {
+            size.clamp(self.batch_size_min.max(1), self.batch_size_max.max(1))
+        } else {
+            size
         }
     }
 }
@@ -86,7 +116,6 @@ fn clamp_wait_ms(ms: u64, min: Duration, max: Duration) -> Duration {
     Duration::from_millis(ms.clamp(lo, hi))
 }
 
-/// Move live wait toward min under load, toward max when quiet.
 fn adapt_live_wait(
     live: Duration,
     min: Duration,
@@ -103,6 +132,22 @@ fn adapt_live_wait(
         FlushReason::Interrupted => ms,
     };
     clamp_wait_ms(next, min, max)
+}
+
+fn adapt_batch_size(
+    live: usize,
+    min: usize,
+    max: usize,
+    increase: usize,
+    reason: FlushReason,
+) -> usize {
+    let increase = increase.max(1);
+    let next = match reason {
+        FlushReason::FullBatch => live.saturating_add(increase),
+        FlushReason::Timeout => (live / 2).max(1),
+        FlushReason::Interrupted => live,
+    };
+    next.clamp(min, max)
 }
 
 enum DbRequest {
@@ -619,6 +664,7 @@ async fn writer_loop(
     let mut pending: Vec<PendingEnqueue> = Vec::new();
     let mut batch_deadline: Option<Instant> = None;
     let mut live_wait = options.initial_live_wait();
+    let mut live_batch_size = options.initial_live_batch_size();
 
     loop {
         let request = if pending.is_empty() {
@@ -637,6 +683,7 @@ async fn writer_loop(
                         &mut pending,
                         &mut batch_deadline,
                         &mut live_wait,
+                        &mut live_batch_size,
                         &options,
                         FlushReason::Timeout,
                     );
@@ -648,6 +695,7 @@ async fn writer_loop(
                         &mut pending,
                         &mut batch_deadline,
                         &mut live_wait,
+                        &mut live_batch_size,
                         &options,
                         FlushReason::Timeout,
                     );
@@ -663,7 +711,7 @@ async fn writer_loop(
                 }
                 pending.push(PendingEnqueue { job, reply });
 
-                while pending.len() < options.batch_size {
+                while pending.len() < live_batch_size {
                     match rx.try_recv() {
                         Ok(DbRequest::Enqueue { job, reply }) => {
                             pending.push(PendingEnqueue { job, reply });
@@ -674,6 +722,7 @@ async fn writer_loop(
                                 &mut pending,
                                 &mut batch_deadline,
                                 &mut live_wait,
+                                &mut live_batch_size,
                                 &options,
                                 FlushReason::Interrupted,
                             );
@@ -687,6 +736,7 @@ async fn writer_loop(
                                 &mut pending,
                                 &mut batch_deadline,
                                 &mut live_wait,
+                                &mut live_batch_size,
                                 &options,
                                 FlushReason::Timeout,
                             );
@@ -695,12 +745,13 @@ async fn writer_loop(
                     }
                 }
 
-                if pending.len() >= options.batch_size {
+                if pending.len() >= live_batch_size {
                     flush_pending(
                         &mut conn,
                         &mut pending,
                         &mut batch_deadline,
                         &mut live_wait,
+                        &mut live_batch_size,
                         &options,
                         FlushReason::FullBatch,
                     );
@@ -713,6 +764,7 @@ async fn writer_loop(
                         &mut pending,
                         &mut batch_deadline,
                         &mut live_wait,
+                        &mut live_batch_size,
                         &options,
                         FlushReason::Interrupted,
                     );
@@ -728,6 +780,7 @@ fn flush_pending(
     pending: &mut Vec<PendingEnqueue>,
     batch_deadline: &mut Option<Instant>,
     live_wait: &mut Duration,
+    live_batch_size: &mut usize,
     options: &SqliteWriteOptions,
     reason: FlushReason,
 ) {
@@ -743,8 +796,17 @@ fn flush_pending(
             *live_wait,
             options.batch_wait_min,
             options.batch_wait_max,
-            options.batch_size,
+            *live_batch_size,
             filled,
+            reason,
+        );
+    }
+    if options.adaptive_batch_size {
+        *live_batch_size = adapt_batch_size(
+            *live_batch_size,
+            options.batch_size_min,
+            options.batch_size_max,
+            options.batch_size_increase,
             reason,
         );
     }
@@ -972,5 +1034,32 @@ mod tests {
 
         let at_max = adapt_live_wait(max, min, max, 32, 1, FlushReason::Timeout);
         assert_eq!(at_max, max);
+    }
+
+    #[test]
+    fn adaptive_batch_size_aimd_clamped() {
+        let min = 8;
+        let max = 64;
+
+        assert_eq!(
+            adapt_batch_size(16, min, max, 2, FlushReason::FullBatch),
+            18
+        );
+        assert_eq!(
+            adapt_batch_size(16, min, max, 2, FlushReason::Timeout),
+            8
+        );
+        assert_eq!(
+            adapt_batch_size(60, min, max, 8, FlushReason::FullBatch),
+            64
+        );
+        assert_eq!(
+            adapt_batch_size(9, min, max, 2, FlushReason::Timeout),
+            8
+        );
+        assert_eq!(
+            adapt_batch_size(16, min, max, 2, FlushReason::Interrupted),
+            16
+        );
     }
 }

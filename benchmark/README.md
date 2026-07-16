@@ -46,12 +46,14 @@ Avoid `cargo run -p maqistor-dispatcher -- --config ...` (wrong cwd).
 
 Listens on `http://127.0.0.1:18081`, job name `bench`.  
 DB under `benchmark/data/` (gitignored).  
-Group-commit: `[persistence]` in `benchmark/maqistor.toml`
-(`batch_size`, fixed `batch_wait_ms`, or optional `adaptive_batch_wait` + min/max).
+Group-commit in `benchmark/maqistor.toml`: `batch_size` (fixed or initial),
+optional `adaptive_batch_size` + min/max/`batch_size_increase`
+(AIMD: full → `+= increase`, timeout → `/2`),
+and wait knobs (`batch_wait_ms` or `adaptive_batch_wait` + min/max).
 
 ## Concurrent (`run_closed.py`)
 
-oha keeps `-c` connections busy (same idea as your manual `oha -c 100 -z 15s` runs).
+oha keeps `-c` connections busy (same idea as your manual `oha -c 100 -z 90s` runs).
 
 ```bash
 python benchmark/run_closed.py
@@ -61,8 +63,8 @@ python benchmark/run_closed.py --stages health,ingest
 
 | Flag | Values | Default | Meaning |
 |------|--------|---------|---------|
-| `--load` | `low` / `medium` / `high` | `low` | `-c` 8 / 32 / 100 |
-| `--sustain` | `low` / `medium` / `high` | `low` | `-z` 10s / 15s / 30s |
+| `--load` | `low` / `medium` / `high` | `low` | `-c` 32 / 100 / 200 |
+| `--sustain` | `low` / `medium` / `high` | `low` | `-z` 30s / 90s / 150s |
 | `--stages` | comma list | all three | `health`, `ingest`, `full` |
 
 Example:
@@ -90,7 +92,7 @@ python benchmark/run_open.py --load medium --sustain low
 
 | Flag | Values | Default | Meaning |
 |------|--------|---------|---------|
-| `--load` | `low` / `medium` / `high` | `low` | `-q` 100 / 1000 / 5000 |
+| `--load` | `low` / `medium` / `high` | `low` | `-q` 10k / 50k / 100k (`-c` 100 / 200 / 400) |
 | `--sustain` | `low` / `medium` / `high` | `low` | `-z` 10s / 15s / 30s |
 | `--stages` | comma list | all three | same as closed |
 
@@ -99,8 +101,8 @@ Example:
 ```text
 stage       offered   achieved   ach/off   p50_ms   p99_ms   errors
 --------------------------------------------------------------------
-health         1000    1000.2      100%      1.5      3.0        0
-ingest         1000     998.1      100%     12.0     40.0        0
+health        10000   10000.2      100%      1.5      3.0        0
+ingest        10000    9980.1      100%     12.0     40.0        0
 full              —    skipped
 ```
 
@@ -117,9 +119,9 @@ ach/off ≈ 100% means the offer was absorbed — not that you found the ceiling
 ## Manual oha (same methodology)
 
 ```powershell
-oha -c 100 -z 15s --latency-correction http://127.0.0.1:18081/health
+oha -c 100 -z 90s --latency-correction http://127.0.0.1:18081/health
 
-oha -c 100 -z 15s -m POST -H "Content-Type: application/json" `
+oha -c 100 -z 90s -m POST -H "Content-Type: application/json" `
   -D benchmark\oha-job.json --latency-correction http://127.0.0.1:18081/jobs
 ```
 

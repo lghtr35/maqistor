@@ -4,11 +4,15 @@
 
 # Durable ingest group-commit
 # [persistence]
-# batch_size = 64
-# adaptive_batch_wait = false   # true → use min/max below
-# batch_wait_ms = 5             # fixed wait when adaptive is false
-# batch_wait_min_ms = 1         # busy → toward min (adaptive only)
-# batch_wait_max_ms = 100       # quiet → toward max (adaptive only)
+# batch_size = 64              # fixed size, or initial when adaptive_batch_size
+# adaptive_batch_size = false  # true → AIMD: full += increase, timeout /2
+# batch_size_min = 8
+# batch_size_max = 256
+# batch_size_increase = 2      # full-batch additive step
+# adaptive_batch_wait = false  # true → use min/max below
+# batch_wait_ms = 5            # fixed wait when adaptive is false
+# batch_wait_min_ms = 1        # busy → toward min (adaptive only)
+# batch_wait_max_ms = 100      # quiet → toward max (adaptive only)
 
 [[jobs]]
 name = "example"

@@ -39,18 +39,17 @@ from oha_util import (
     workspace_root,
 )
 
-# Offered queries/sec (-q); connections kept high enough to sustain the offer
+# Offered queries/sec (-q); connections kept high enough to sustain the offer.
 LOAD_QPS = {
-    "low": 100,
-    "medium": 1000,
-    "high": 5000,
+    "low": 10_000,
+    "medium": 50_000,
+    "high": 100_000,
 }
 
-# Extra connections headroom vs offered rate
 LOAD_CONNECTIONS = {
-    "low": 50,
-    "medium": 100,
-    "high": 200,
+    "low": 100,
+    "medium": 200,
+    "high": 400,
 }
 
 SUSTAIN_SECONDS = {

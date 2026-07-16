@@ -42,15 +42,15 @@ from oha_util import (
 
 # Concurrent connections (-c)
 LOAD_CONNECTIONS = {
-    "low": 8,
-    "medium": 32,
-    "high": 100,
+    "low": 32,
+    "medium": 100,
+    "high": 200,
 }
 
 SUSTAIN_SECONDS = {
-    "low": 10,
-    "medium": 15,
-    "high": 30,
+    "low": 30,
+    "medium": 90,
+    "high": 150,
 }
 
 SKIP_REASONS = {

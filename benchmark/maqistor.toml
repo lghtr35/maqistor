@@ -3,12 +3,15 @@ listen = "127.0.0.1:18081"
 database_path = "./benchmark/data/maqistor.db"
 
 [persistence]
-batch_size = 64
-# Fixed wait (default). Set adaptive_batch_wait = true to use min/max instead.
+batch_size = 16
+adaptive_batch_size = true
+batch_size_min = 8
+batch_size_max = 256
+batch_size_increase = 8
 adaptive_batch_wait = true
 batch_wait_ms = 5
-# batch_wait_min_ms = 1
-# batch_wait_max_ms = 50
+batch_wait_min_ms = 1
+batch_wait_max_ms = 50
 
 [[jobs]]
 name = "bench"
