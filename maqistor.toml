@@ -1,0 +1,16 @@
+# Optional — defaults shown in comments
+# listen = "0.0.0.0:8080"
+# database_path = "./data/maqistor.db"
+
+# Durable ingest group-commit
+# [persistence]
+# batch_size = 64
+# adaptive_batch_wait = false   # true → use min/max below
+# batch_wait_ms = 5             # fixed wait when adaptive is false
+# batch_wait_min_ms = 1         # busy → toward min (adaptive only)
+# batch_wait_max_ms = 100       # quiet → toward max (adaptive only)
+
+[[jobs]]
+name = "example"
+concurrency = 1
+max_retries = 3

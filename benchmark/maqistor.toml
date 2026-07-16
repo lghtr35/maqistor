@@ -1,0 +1,16 @@
+# Benchmark test config
+listen = "127.0.0.1:18081"
+database_path = "./benchmark/data/maqistor.db"
+
+[persistence]
+batch_size = 64
+# Fixed wait (default). Set adaptive_batch_wait = true to use min/max instead.
+adaptive_batch_wait = true
+batch_wait_ms = 5
+# batch_wait_min_ms = 1
+# batch_wait_max_ms = 50
+
+[[jobs]]
+name = "bench"
+concurrency = 1
+max_retries = 3

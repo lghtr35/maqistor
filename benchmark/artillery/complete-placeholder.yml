@@ -1,0 +1,21 @@
+# Stub for later open-loop journey once sleep-job workers exist.
+# Prefer: python benchmark/run_open.py --stages full (currently skipped)
+# or oha -D body file against POST /jobs (submit only; E2E from DB after).
+# Artillery is no longer used by the Python runners.
+
+config:
+  target: "http://127.0.0.1:18081"
+  phases:
+    - duration: 1
+      arrivalRate: 1
+      name: "placeholder"
+  http:
+    timeout: 10
+
+scenarios:
+  - name: "full_placeholder"
+    flow:
+      - think: 1
+      # Future: open-loop submit only (sleep-then-succeed jobs). Do NOT poll.
+      # After the run, read E2E from DB: completed_at/updated_at - created_at.
+      # - post: { url: "/jobs", json: { name: "bench-full", payload: { sleep_ms: 50 } } }

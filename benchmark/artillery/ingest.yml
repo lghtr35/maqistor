@@ -1,0 +1,32 @@
+# Open-loop reference: POST /jobs under offered arrivals.
+# Requires [[jobs]] name = "bench" in the server config.
+# Prefer: python benchmark/run_open.py --stages ingest
+# Or: artillery run benchmark/artillery/ingest.yml
+
+config:
+  target: "http://127.0.0.1:18081"
+  phases:
+    - duration: 5
+      arrivalRate: 10
+      name: "warmup"
+    - duration: 15
+      arrivalRate: 25
+      name: "sustained"
+  http:
+    timeout: 30
+
+scenarios:
+  - name: "ingest"
+    flow:
+      - post:
+          url: "/jobs"
+          headers:
+            Content-Type: "application/json"
+          json:
+            name: "bench"
+            payload:
+              n: 1
+          expect:
+            - statusCode: 201
+            - hasProperty: "id"
+            - hasProperty: "status"

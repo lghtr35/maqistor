@@ -1,0 +1,31 @@
+[package]
+name = "maqistor-dispatcher"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "maqistor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bollard.workspace = true
+clap.workspace = true
+maqistor-api.workspace = true
+maqistor-persistence.workspace = true
+maqistor-engine.workspace = true
+prost.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+tonic-build.workspace = true

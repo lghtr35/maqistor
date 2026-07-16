@@ -1,0 +1,23 @@
+# Open-loop reference: GET /health under offered arrivals.
+# Prefer: python benchmark/run_open.py --stages health
+# Or: artillery run benchmark/artillery/health.yml
+
+config:
+  target: "http://127.0.0.1:18081"
+  phases:
+    - duration: 5
+      arrivalRate: 10
+      name: "warmup"
+    - duration: 15
+      arrivalRate: 25
+      name: "sustained"
+  http:
+    timeout: 10
+
+scenarios:
+  - name: "health"
+    flow:
+      - get:
+          url: "/health"
+          expect:
+            - statusCode: 200
