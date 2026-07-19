@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+maqistor-engine.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
 uuid.workspace = true

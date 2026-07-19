@@ -29,7 +29,6 @@ from oha_util import (
     BASE_URL,
     ensure_ingest_body,
     error_count,
-    expected_success_code,
     latency_ms,
     require_oha,
     require_standing_server,
@@ -67,6 +66,11 @@ STAGE_ORDER = ("health", "ingest", "full")
 DESCRIPTIONS = {
     "health": "GET /health — oha rate-limited offer",
     "ingest": "POST /jobs — oha rate-limited offer (jobs/s = req/s)",
+}
+
+EXPECTED_SUCCESS = {
+    "health": "204",
+    "ingest": "201",
 }
 
 
@@ -118,6 +122,16 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(SUSTAIN_SECONDS),
         default="low",
         help="Duration (-z)",
+    )
+    parser.add_argument(
+        "--qps",
+        type=int,
+        help="Override the selected profile's offered QPS (-q)",
+    )
+    parser.add_argument(
+        "--connections",
+        type=int,
+        help="Override the selected profile's concurrent connections (-c)",
     )
     parser.add_argument(
         "--stages",
@@ -180,8 +194,12 @@ def print_summary(
 
 def main() -> None:
     args = parse_args()
-    offered = LOAD_QPS[args.load]
-    connections = LOAD_CONNECTIONS[args.load]
+    offered = args.qps or LOAD_QPS[args.load]
+    connections = args.connections or LOAD_CONNECTIONS[args.load]
+    if offered <= 0:
+        raise SystemExit("--qps must be greater than zero")
+    if connections <= 0:
+        raise SystemExit("--connections must be greater than zero")
     duration_s = SUSTAIN_SECONDS[args.sustain]
     stages = parse_stages(args.stages)
 
@@ -249,7 +267,7 @@ def main() -> None:
             )
 
         codes = status_counts(report)
-        want = expected_success_code(stage)
+        want = EXPECTED_SUCCESS[stage]
         if codes and want not in codes:
             raise SystemExit(
                 f"{stage}: expected HTTP {want}, got status codes {codes}. "

@@ -39,7 +39,7 @@ def require_oha() -> str:
 def require_standing_server(script_name: str) -> None:
     try:
         with urllib.request.urlopen(f"{BASE_URL}/health", timeout=2) as resp:
-            if resp.status != 200:
+            if resp.status < 200 or resp.status >= 300:
                 raise SystemExit(f"health returned {resp.status}")
     except urllib.error.URLError as err:
         raise SystemExit(
@@ -72,6 +72,7 @@ def run_oha(
         oha,
         "-z",
         f"{duration_s}s",
+        "--wait-ongoing-requests-after-deadline",
         "--latency-correction",
         "--output-format",
         "json",
@@ -133,11 +134,15 @@ def status_counts(report: dict) -> dict[str, int]:
 
 
 def error_count(report: dict) -> int:
-    """Non-success HTTP statuses. Ignores oha end-of-run deadline aborts."""
-    success_codes = {"200", "201", "204"}
+    """Non-2xx HTTP statuses. Ignores oha end-of-run deadline aborts."""
     bad = 0
     for code, count in status_counts(report).items():
-        if code not in success_codes:
+        try:
+            n = int(code)
+        except ValueError:
+            bad += count
+            continue
+        if n < 200 or n >= 300:
             bad += count
     for name, count in (report.get("errorDistribution") or {}).items():
         label = str(name).lower()
@@ -155,7 +160,3 @@ def success_rate(report: dict) -> float | None:
     if metrics.get("success_rate") is not None:
         return float(metrics["success_rate"])
     return None
-
-
-def expected_success_code(stage: str) -> str:
-    return "201" if stage == "ingest" else "200"

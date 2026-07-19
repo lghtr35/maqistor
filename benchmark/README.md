@@ -8,9 +8,12 @@ Driver: **[oha](https://github.com/hatoo/oha)** (orchestrated by Python). Same s
 |--------|----------|----------|
 | `run_closed.py` | `-c` concurrent connections | Where does **throughput drop** across stages? |
 | `run_open.py` | `-q` offered QPS | Can we **absorb a target rate**? |
+| `run_capacity.py` | closed + open sweeps | What is the durable-ingest ceiling? |
 
 Use **closed** to find stagger (health → ingest → full).  
 Use **open** to check whether a chosen offer holds (ach/off).
+All runners wait for requests already in flight at the duration deadline, so
+the last durable batch is counted rather than aborted by the load generator.
 
 Dispatch is internal — not a stage. It only appears inside full E2E later.
 
@@ -46,10 +49,9 @@ Avoid `cargo run -p maqistor-dispatcher -- --config ...` (wrong cwd).
 
 Listens on `http://127.0.0.1:18081`, job name `bench`.  
 DB under `benchmark/data/` (gitignored).  
-Group-commit in `benchmark/maqistor.toml`: `batch_size` (fixed or initial),
-optional `adaptive_batch_size` + min/max/`batch_size_increase`
-(AIMD: full → `+= increase`, timeout → `/2`),
-and wait knobs (`batch_wait_ms` or `adaptive_batch_wait` + min/max).
+Group-commit self-tunes from request rate, SQL commit rate, commit duration, and
+batch fill. `benchmark/maqistor.toml` may set an EWMA window and optional hard
+batch/wait caps, but never selects a fixed batch or timeout.
 
 ## Concurrent (`run_closed.py`)
 
@@ -78,7 +80,7 @@ full          skipped
 ```
 
 - **ops/s** = oha `requestsPerSec` (ingest ⇒ **jobs/s**)
-- Fails fast if status codes are not `200` (health) / `201` (ingest)
+- Fails fast if status codes are not `204` (health) / `201` (ingest)
 - Writes `benchmark/results/summary-closed-*.json` (+ raw oha JSON under `results/raw/`)
 
 ## Offer (`run_open.py`)
@@ -107,6 +109,37 @@ full              —    skipped
 ```
 
 ach/off ≈ 100% means the offer was absorbed — not that you found the ceiling.
+
+## Capacity (`run_capacity.py`)
+
+Use this for performance work. It tests only durable `POST /jobs`, first with a
+closed-loop concurrency sweep and then with an open-loop QPS sweep. Raw oha
+reports are retained for every point.
+
+```powershell
+# Six closed and six open points, 30 seconds each (about six minutes total).
+python benchmark\run_capacity.py
+
+# Discover the closed-loop ceiling first.
+python benchmark\run_capacity.py --mode closed
+
+# Test the 8k–14k region with a generous client concurrency.
+python benchmark\run_capacity.py --mode open --open-connections 1000 `
+  --open-qps 8000,9000,10000,11000,12000,14000
+```
+
+An open-loop point is marked **stable** only when it has zero errors, achieves
+at least 98% of its offered QPS, and stays below the configured p99 guardrail
+(100 ms by default; override with `--max-p99-ms`). The closed-loop peak is an
+observed ceiling for this machine and local oha client, not a universal SQLite
+limit.
+
+For one-off points, both ordinary runners accept exact overrides:
+
+```powershell
+python benchmark\run_closed.py --connections 800 --stages ingest
+python benchmark\run_open.py --qps 10000 --connections 1000 --stages ingest
+```
 
 ## Stages
 

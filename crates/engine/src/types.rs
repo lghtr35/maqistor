@@ -2,11 +2,10 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Job {
-    pub id: Uuid,
+    /// Assigned by SQLite when the durable insert commits.
+    pub id: i64,
     pub name: String,
     pub status: JobStatus,
     pub payload: Vec<u8>,
@@ -20,7 +19,7 @@ impl Job {
     pub fn new_pending(name: impl Into<String>, payload: Vec<u8>) -> Self {
         let now = unix_now();
         Self {
-            id: Uuid::new_v4(),
+            id: 0,
             name: name.into(),
             status: JobStatus::Pending,
             payload,
@@ -32,7 +31,6 @@ impl Job {
     }
 }
 
-/// Registered job queue metadata persisted across restarts.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct JobQueue {
     pub name: String,
@@ -66,19 +64,18 @@ pub enum JobStatus {
 impl JobStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            JobStatus::Pending => "pending",
-            JobStatus::Running => "running",
-            JobStatus::Completed => "completed",
-            JobStatus::Failed => "failed",
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
         }
     }
-
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "pending" => Some(JobStatus::Pending),
-            "running" => Some(JobStatus::Running),
-            "completed" => Some(JobStatus::Completed),
-            "failed" => Some(JobStatus::Failed),
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
             _ => None,
         }
     }
@@ -86,14 +83,14 @@ impl JobStatus {
 
 impl fmt::Display for JobStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
     #[error("job not found: {0}")]
-    NotFound(Uuid),
+    NotFound(i64),
     #[error("queue not found: {0}")]
     QueueNotFound(String),
     #[error("internal store error: {0}")]

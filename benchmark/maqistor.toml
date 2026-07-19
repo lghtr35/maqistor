@@ -3,17 +3,21 @@ listen = "127.0.0.1:18081"
 database_path = "./benchmark/data/maqistor.db"
 
 [persistence]
-batch_size = 16
-adaptive_batch_size = true
-batch_size_min = 8
-batch_size_max = 256
-batch_size_increase = 8
-adaptive_batch_wait = true
-batch_wait_ms = 5
-batch_wait_min_ms = 1
-batch_wait_max_ms = 50
+durability = "balanced"
+ewma_window = 4
 
-[[jobs]]
+[persistence.limits]
+batch_size_min = 256
+batch_size_max = 4096
+batch_wait_min_ms = 1
+batch_wait_max_ms = 2
+
+[persistence.adaptation]
+batch_probe_factor = 1.25
+batch_backoff_factor = 0.80
+
+[[workers]]
 name = "bench"
+replicas = 1
 concurrency = 1
 max_retries = 3

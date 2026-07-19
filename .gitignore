@@ -32,3 +32,6 @@ target
 /benchmark/data
 /benchmark/oha-job.json
 __pycache__
+
+# AI files
+.agents
