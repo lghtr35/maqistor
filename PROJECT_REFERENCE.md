@@ -54,6 +54,8 @@ The two SQLite files have different write paths:
 
 This split lets submission/claim writes and completion writes use independent writer loops. It is a local durability design, not a distributed database or a multi-host control plane.
 
+Hot-path writers share set-oriented SQL helpers in `crates/persistence/src/sqlite/bulk.rs`: multi-row `INSERT` and `WITH … AS (VALUES …) UPDATE … FROM` chunks (64 rows per statement, `prepare_cached`), used by enqueue, claim, repend, `insert_running`, and complete.
+
 ## Job lifecycle
 
 ### Domain records

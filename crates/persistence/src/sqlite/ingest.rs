@@ -13,6 +13,7 @@ use tracing::debug;
 use maqistor_engine::{Job, JobQueue, JobStatus, MAX_CLAIM_BATCH_SIZE, StoreError};
 
 use super::adaptive::{AdaptiveBatchController, FlushReason};
+use super::bulk::{self, ROWS_PER_STATEMENT};
 use super::common::{
     IngestJobRow, ReadPool, RwConnection, apply_ingest_schema, new_dispatch_id,
     row_to_queue, unix_now,
@@ -20,29 +21,15 @@ use super::common::{
 use super::options::{DurabilityMode, SqliteWriteOptions};
 
 const CHANNEL_CAPACITY: usize = 1024;
-const INSERT_ROWS_PER_STATEMENT: usize = 64;
 
-fn jobs_insert_sql(rows: usize) -> String {
-    debug_assert!(rows > 0);
-    let values = (0..rows)
-        .map(|row| {
-            let offset = row * 5;
-            format!(
-                "(?{}, ?{}, ?{}, 0, ?{}, ?{})",
-                offset + 1,
-                offset + 2,
-                offset + 3,
-                offset + 4,
-                offset + 5,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "INSERT INTO jobs (queue_name, status, payload, execution_count, created_at, updated_at) \
-         VALUES {values}"
-    )
-}
+const JOBS_INSERT_COLUMNS: &[&str] = &[
+    "queue_name",
+    "status",
+    "payload",
+    "execution_count",
+    "created_at",
+    "updated_at",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct IngestClaimed {
@@ -173,20 +160,23 @@ impl IngestConn {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
 
-            for chunk in to_insert.chunks_mut(INSERT_ROWS_PER_STATEMENT) {
+            let execution_count = 0_i64;
+            for chunk in to_insert.chunks_mut(ROWS_PER_STATEMENT) {
                 let status = "pending";
-                let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 5);
+                let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 6);
                 for pending in chunk.iter() {
                     values.push(&pending.job.name);
                     values.push(&status);
                     values.push(&pending.job.payload);
+                    values.push(&execution_count);
                     values.push(&pending.job.created_at);
                     values.push(&pending.job.updated_at);
                 }
-                tx.prepare_cached(&jobs_insert_sql(chunk.len()))
-                    .map_err(|err| StoreError::Internal(err.to_string()))?
-                    .execute(params_from_iter(values))
-                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                bulk::execute_cached_tx(
+                    &tx,
+                    &bulk::insert_sql("jobs", JOBS_INSERT_COLUMNS, chunk.len()),
+                    params_from_iter(values),
+                )?;
                 let first_id = tx.last_insert_rowid() - chunk.len() as i64 + 1;
                 for (offset, pending) in chunk.iter_mut().enumerate() {
                     pending.job.id = first_id + offset as i64;
@@ -236,7 +226,6 @@ impl IngestConn {
             id: i64,
             name: String,
             payload: Vec<u8>,
-            execution_count: i64,
             created_at: i64,
             max_retries: i64,
             timeout_secs: i64,
@@ -244,7 +233,7 @@ impl IngestConn {
         let pending: Vec<PendingClaim> = {
             let mut statement = tx
                 .prepare(
-                    "SELECT jobs.id, jobs.queue_name, jobs.payload, jobs.execution_count,
+                    "SELECT jobs.id, jobs.queue_name, jobs.payload,
                             jobs.created_at, job_queues.max_retries, job_queues.timeout_secs
                      FROM jobs JOIN job_queues ON job_queues.name = jobs.queue_name
                      WHERE jobs.queue_name = ?1 AND jobs.status = 'pending'
@@ -257,10 +246,9 @@ impl IngestConn {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         payload: row.get(2)?,
-                        execution_count: row.get(3)?,
-                        created_at: row.get(4)?,
-                        max_retries: row.get(5)?,
-                        timeout_secs: row.get(6)?,
+                        created_at: row.get(3)?,
+                        max_retries: row.get(4)?,
+                        timeout_secs: row.get(5)?,
                     })
                 })
                 .map_err(|err| StoreError::Internal(err.to_string()))?
@@ -268,55 +256,95 @@ impl IngestConn {
                 .map_err(|err| StoreError::Internal(err.to_string()))?
         };
         let now = unix_now();
-        let mut update = tx
-            .prepare(
-                "UPDATE jobs SET status = 'claimed', dispatch_id = ?1,
-                 execution_count = execution_count + 1, updated_at = ?2
-                 WHERE id = ?3 AND status = 'pending'",
-            )
-            .map_err(|err| StoreError::Internal(err.to_string()))?;
         let mut claimed = Vec::with_capacity(pending.len());
-        for row in pending {
-            let execution_count = u32::try_from(row.execution_count)
-                .map_err(|err| StoreError::Internal(err.to_string()))?
-                .checked_add(1)
-                .ok_or_else(|| StoreError::Internal("job execution count overflow".into()))?;
-            let max_retries = u32::try_from(row.max_retries)
-                .map_err(|err| StoreError::Internal(err.to_string()))?;
-            let timeout_secs = u64::try_from(row.timeout_secs)
-                .map_err(|err| StoreError::Internal(err.to_string()))?;
-            let dispatch_id = new_dispatch_id();
-            let updated = update
-                .execute(params![dispatch_id, now, row.id])
-                .map_err(|err| StoreError::Internal(err.to_string()))?;
-            if updated == 1 {
+        for chunk in pending.chunks(ROWS_PER_STATEMENT) {
+            let dispatch_ids: Vec<String> =
+                (0..chunk.len()).map(|_| new_dispatch_id()).collect();
+            let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 3);
+            for (row, dispatch_id) in chunk.iter().zip(dispatch_ids.iter()) {
+                values.push(&row.id);
+                values.push(dispatch_id);
+                values.push(&now);
+            }
+            let sql = bulk::update_from_values_sql(
+                "jobs",
+                "v",
+                "status = 'claimed', dispatch_id = v.dispatch_id, \
+                 execution_count = execution_count + 1, updated_at = v.updated_at",
+                &["id", "dispatch_id", "updated_at"],
+                chunk.len(),
+                "jobs.id = v.id AND jobs.status = 'pending'",
+                Some("jobs.id, jobs.dispatch_id, jobs.execution_count, jobs.updated_at"),
+            );
+            let updated = bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            let by_id: std::collections::HashMap<i64, (String, i64, i64)> = updated
+                .into_iter()
+                .map(|(id, dispatch_id, execution_count, updated_at)| {
+                    (id, (dispatch_id, execution_count, updated_at))
+                })
+                .collect();
+            for row in chunk {
+                let Some((dispatch_id, execution_count, updated_at)) = by_id.get(&row.id) else {
+                    continue;
+                };
+                let execution_count = u32::try_from(*execution_count)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                let max_retries = u32::try_from(row.max_retries)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                let timeout_secs = u64::try_from(row.timeout_secs)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
                 claimed.push(IngestClaimed {
                     id: row.id,
-                    name: row.name,
-                    payload: row.payload,
+                    name: row.name.clone(),
+                    payload: row.payload.clone(),
                     execution_count,
                     max_retries,
                     timeout_secs,
-                    dispatch_id,
+                    dispatch_id: dispatch_id.clone(),
                     created_at: row.created_at,
-                    updated_at: now,
+                    updated_at: *updated_at,
                 });
             }
         }
-        drop(update);
         tx.commit()
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(claimed)
     }
 
     fn repend(&mut self, job_id: i64, dispatch_id: &str) -> Result<(), StoreError> {
-        self.conn
-            .execute(
-                "UPDATE jobs SET status = 'pending', dispatch_id = NULL, updated_at = ?1
-                 WHERE id = ?2 AND status = 'claimed' AND dispatch_id = ?3",
-                params![unix_now(), job_id, dispatch_id],
-            )
-            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        self.repend_batch(&[(job_id, dispatch_id)])
+    }
+
+    fn repend_batch(&mut self, pairs: &[(i64, &str)]) -> Result<(), StoreError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now();
+        for chunk in pairs.chunks(ROWS_PER_STATEMENT) {
+            let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 3);
+            for (job_id, dispatch_id) in chunk {
+                values.push(job_id);
+                values.push(dispatch_id);
+                values.push(&now);
+            }
+            let sql = bulk::update_from_values_sql(
+                "jobs",
+                "v",
+                "status = 'pending', dispatch_id = NULL, updated_at = v.updated_at",
+                &["id", "dispatch_id", "updated_at"],
+                chunk.len(),
+                "jobs.id = v.id AND jobs.status = 'claimed' AND jobs.dispatch_id = v.dispatch_id",
+                None,
+            );
+            bulk::execute_cached(&self.conn, &sql, params_from_iter(values))?;
+        }
         Ok(())
     }
 
