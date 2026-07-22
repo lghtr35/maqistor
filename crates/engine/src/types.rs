@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Job {
-    /// Assigned by SQLite when the durable insert commits.
     pub id: i64,
     pub name: String,
     pub status: JobStatus,
@@ -42,9 +41,7 @@ pub struct JobQueue {
     pub name: String,
     pub max_retries: u32,
     pub timeout_secs: u64,
-    /// Unix time in milliseconds.
     pub created_at: i64,
-    /// Unix time in milliseconds.
     pub updated_at: i64,
 }
 
@@ -105,7 +102,6 @@ pub enum StoreError {
     Internal(String),
 }
 
-/// Current unix time in milliseconds.
 pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

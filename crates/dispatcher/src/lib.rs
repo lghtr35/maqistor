@@ -76,51 +76,43 @@ impl WorkerDispatcher for RegistryDispatcher {
             Ok(reserved)
         }
     }
-    fn dispatch(
-        &self,
-        permit: ReservedDispatch,
-        job: Job,
-    ) -> impl std::future::Future<Output = Result<(), DispatchError>> + Send {
-        async move {
-            let permit = permit
-                .into_permit()
-                .into_any()
-                .downcast::<RegistryPermit>()
-                .map_err(|_| DispatchError::Internal("foreign dispatch permit".into()))?;
-            let dispatch_id = job
-                .dispatch_id
-                .clone()
-                .ok_or_else(|| DispatchError::Internal("claimed job has no dispatch id".into()))?;
-            let frame = WireFrame::v1(WorkerMessage::JobDispatch {
-                job_id: job.id,
-                dispatch_id,
-                execution_count: job.execution_count,
-                payload: job.payload,
-            });
-            let outbound = {
-                let workers = permit.registry.0.lock().await;
-                workers
-                    .get(&permit.worker_id)
-                    .map(|worker| worker.outbound.clone())
-            }
-            .ok_or_else(|| DispatchError::Internal("reserved worker disappeared".into()))?;
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            let queued = outbound.send(OutboundFrame { frame, ack: ack_tx }).is_ok();
-            let wrote = queued && matches!(ack_rx.await, Ok(Ok(())));
-            if !wrote {
-                release_permit(&permit.registry, permit.worker_id).await;
-                return Err(DispatchError::Internal(
-                    "worker dispatch write failed".into(),
-                ));
-            }
-            Ok(())
+    async fn dispatch(&self, permit: ReservedDispatch, job: Job) -> Result<(), DispatchError> {
+        let permit = permit
+            .into_permit()
+            .into_any()
+            .downcast::<RegistryPermit>()
+            .map_err(|_| DispatchError::Internal("foreign dispatch permit".into()))?;
+        let dispatch_id = job
+            .dispatch_id
+            .clone()
+            .ok_or_else(|| DispatchError::Internal("claimed job has no dispatch id".into()))?;
+        let frame = WireFrame::v1(WorkerMessage::JobDispatch {
+            job_id: job.id,
+            dispatch_id,
+            execution_count: job.execution_count,
+            payload: job.payload,
+        });
+        let outbound = {
+            let workers = permit.registry.0.lock().await;
+            workers
+                .get(&permit.worker_id)
+                .map(|worker| worker.outbound.clone())
         }
+        .ok_or_else(|| DispatchError::Internal("reserved worker disappeared".into()))?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let queued = outbound.send(OutboundFrame { frame, ack: ack_tx }).is_ok();
+        let wrote = queued && matches!(ack_rx.await, Ok(Ok(())));
+        if !wrote {
+            release_permit(&permit.registry, permit.worker_id).await;
+            return Err(DispatchError::Internal(
+                "worker dispatch write failed".into(),
+            ));
+        }
+        Ok(())
     }
-    fn release(&self, permit: ReservedDispatch) -> impl std::future::Future<Output = ()> + Send {
-        async move {
-            if let Ok(permit) = permit.into_permit().into_any().downcast::<RegistryPermit>() {
-                release_permit(&permit.registry, permit.worker_id).await;
-            }
+    async fn release(&self, permit: ReservedDispatch) {
+        if let Ok(permit) = permit.into_permit().into_any().downcast::<RegistryPermit>() {
+            release_permit(&permit.registry, permit.worker_id).await;
         }
     }
     fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<WorkerEvent>> {
@@ -135,11 +127,11 @@ pub struct TlsFiles {
     pub key_path: String,
 }
 #[derive(Debug, Clone)]
-pub struct WorkerState {
-    pub queue_name: String,
-    pub running_jobs: u32,
-    pub free_slots: u32,
-    pub last_activity: Instant,
+struct WorkerState {
+    queue_name: String,
+    running_jobs: u32,
+    free_slots: u32,
+    last_activity: Instant,
     reserved_slots: u32,
     outbound: mpsc::UnboundedSender<OutboundFrame>,
 }
@@ -164,6 +156,12 @@ async fn release_permit(registry: &WorkerRegistry, worker_id: Uuid) {
         worker.reserved_slots = worker.reserved_slots.saturating_sub(1);
     }
 }
+
+fn record_worker_capacity(state: &mut WorkerState, running_jobs: u32, free_slots: u32) {
+    state.running_jobs = running_jobs;
+    state.free_slots = free_slots;
+    state.reserved_slots = 0;
+}
 #[derive(Clone)]
 pub struct WorkerRegistry(
     Arc<Mutex<HashMap<Uuid, WorkerState>>>,
@@ -175,18 +173,6 @@ impl Default for WorkerRegistry {
         Self(Arc::new(Mutex::new(HashMap::new())), events)
     }
 }
-impl WorkerRegistry {
-    pub async fn snapshot(&self) -> HashMap<Uuid, WorkerState> {
-        self.0.lock().await.clone()
-    }
-    pub async fn has_capacity(&self, queue_name: &str) -> bool {
-        self.0.lock().await.values().any(|worker| {
-            worker.queue_name == queue_name
-                && worker.free_slots.saturating_sub(worker.reserved_slots) > 0
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ManagedQueue {
     pub name: String,
@@ -208,7 +194,7 @@ impl DockerWorkerSupervisor {
             desired_images: Arc::new(Mutex::new(HashMap::new())),
         })
     }
-    pub async fn reconcile(&self) -> Result<()> {
+    async fn reconcile(&self) -> Result<()> {
         for queue in &self.queues {
             for ordinal in 0..queue.replicas {
                 self.ensure(queue, ordinal).await?;
@@ -507,12 +493,13 @@ async fn handle_worker(
     let result: Result<()> = async {
         loop {
             let frame = timeout(Duration::from_secs(15), read_frame(&mut reader)).await??;
-            let mut workers = registry.0.lock().await;
-            let state = workers
-                .get_mut(&instance_id)
-                .context("worker disappeared")?;
-            state.last_activity = Instant::now();
-            match frame.payload {
+            let event = {
+                let mut workers = registry.0.lock().await;
+                let state = workers
+                    .get_mut(&instance_id)
+                    .context("worker disappeared")?;
+                state.last_activity = Instant::now();
+                match frame.payload {
                 WorkerMessage::JobResult {
                     job_id,
                     dispatch_id,
@@ -520,9 +507,7 @@ async fn handle_worker(
                     running_jobs,
                     free_slots,
                 } => {
-                    state.running_jobs = running_jobs;
-                    state.free_slots = free_slots;
-                    state.reserved_slots = 0;
+                    record_worker_capacity(state, running_jobs, free_slots);
                     let outcome = match result {
                         maqistor_worker_protocol::JobResult::Succeeded { payload } => {
                             JobOutcome::Succeeded(payload)
@@ -531,21 +516,49 @@ async fn handle_worker(
                             JobOutcome::Failed(message)
                         }
                     };
-                    let _ = registry.1.send(WorkerEvent::Result {
+                    Some(WorkerEvent::Result {
                         queue_name: state.queue_name.clone(),
                         result: WorkerResult {
                             job_id,
                             dispatch_id,
                             outcome,
                         },
-                    });
+                    })
                 }
-                WorkerMessage::Heartbeat => {}
-                _ => anyhow::bail!("invalid post-registration worker frame"),
+                    WorkerMessage::Heartbeat => None,
+                    _ => anyhow::bail!("invalid post-registration worker frame"),
+                }
+            };
+            if let Some(event) = event {
+                let _ = registry.1.send(event);
             }
         }
     }
     .await;
     registry.0.lock().await.remove(&instance_id);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_result_replaces_reservation_estimate_with_capacity_snapshot() {
+        let (outbound, _rx) = mpsc::unbounded_channel();
+        let mut worker = WorkerState {
+            queue_name: "email".into(),
+            running_jobs: 3,
+            free_slots: 0,
+            last_activity: Instant::now(),
+            reserved_slots: 3,
+            outbound,
+        };
+
+        record_worker_capacity(&mut worker, 2, 1);
+
+        assert_eq!(worker.reserved_slots, 0);
+        assert_eq!(worker.running_jobs, 2);
+        assert_eq!(worker.free_slots, 1);
+    }
 }

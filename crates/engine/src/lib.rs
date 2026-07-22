@@ -1,22 +1,18 @@
 mod adaptive;
 mod types;
 
-use futures_util::StreamExt;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{Arc, Mutex},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 pub use adaptive::{AdaptiveBatch, DirectionStreak, Ewma};
 pub use types::{Job, JobQueue, JobStatus, StoreError, unix_now};
 
-/// The largest single durable claim. This bounds a scheduler pass even when a
-/// caller supplies an excessively large dispatch batch configuration.
 pub const MAX_CLAIM_BATCH_SIZE: usize = 16_384;
 
-/// A worker outcome fenced by the dispatch lease that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
     Succeeded(Vec<u8>),
@@ -82,18 +78,16 @@ pub trait DurableStore: Send + Sync {
     fn claim_next(
         &self,
         queue_name: &str,
-        lease_duration_secs: i64,
     ) -> impl Future<Output = Result<Option<Job>, StoreError>> + Send;
     fn claim_batch(
         &self,
         queue_name: &str,
-        lease_duration_secs: i64,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<Job>, StoreError>> + Send {
         async move {
             let mut jobs = Vec::with_capacity(limit.min(MAX_CLAIM_BATCH_SIZE));
             for _ in 0..limit.min(MAX_CLAIM_BATCH_SIZE) {
-                let Some(job) = self.claim_next(queue_name, lease_duration_secs).await? else {
+                let Some(job) = self.claim_next(queue_name).await? else {
                     break;
                 };
                 jobs.push(job);
@@ -110,6 +104,19 @@ pub trait DurableStore: Send + Sync {
         async {
             Err(StoreError::Internal(
                 "store does not support job completion".into(),
+            ))
+        }
+    }
+    fn complete_worker_result(
+        &self,
+        job_id: i64,
+        dispatch_id: &str,
+        outcome: JobOutcome,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        async move {
+            Ok(matches!(
+                self.complete(job_id, dispatch_id, outcome).await?,
+                Some(job) if job.status == JobStatus::Pending
             ))
         }
     }
@@ -144,8 +151,6 @@ pub struct QueueReservation {
     pub count: usize,
 }
 
-/// Opaque worker-capacity reservation. The engine can carry it but never
-/// learns which worker or slot owns it.
 pub trait DispatchPermit: Send {
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
 }
@@ -235,8 +240,16 @@ pub struct Engine<S: DurableStore, D: WorkerDispatcher> {
 
 struct Scheduler {
     tx: mpsc::UnboundedSender<String>,
+    delivery_tx: mpsc::Sender<DeliveryWork>,
+    delivery_budget: Arc<Semaphore>,
     awake: Mutex<HashMap<String, bool>>,
     options: DispatchOptions,
+}
+
+struct DeliveryWork {
+    permit: ReservedDispatch,
+    job: Job,
+    _budget: OwnedSemaphorePermit,
 }
 
 impl<
@@ -247,15 +260,19 @@ impl<
     pub fn with_dispatcher(store: S, dispatcher: D, options: DispatchOptions) -> Self {
         options.validate().expect("invalid dispatch options");
         let (tx, rx) = mpsc::unbounded_channel();
+        let (delivery_tx, delivery_rx) = mpsc::channel(options.max_in_flight);
         let engine = Self {
             store,
             dispatcher,
             scheduler: Arc::new(Scheduler {
                 tx,
+                delivery_tx,
+                delivery_budget: Arc::new(Semaphore::new(options.max_in_flight)),
                 awake: Mutex::new(HashMap::new()),
                 options,
             }),
         };
+        engine.start_delivery_pump(delivery_rx);
         engine.start_scheduler(rx);
         engine
     }
@@ -284,38 +301,18 @@ impl<
         })
     }
 
-    pub async fn recover(&self, now: i64) -> Result<Vec<Job>, EngineError> {
-        let recovered = self.store.recover_stale_leases(now).await?;
-        for queue in recovered
-            .iter()
-            .filter(|job| job.status == JobStatus::Pending)
-            .map(|job| job.name.clone())
-            .collect::<HashSet<_>>()
-        {
-            self.ensure_awake(queue).await;
-        }
-        Ok(recovered)
-    }
-
-    /// Persists a fenced worker result and schedules immediate retries only
-    /// after the result transaction has committed.
-    pub async fn complete(
+    async fn complete_worker_result(
         &self,
         job_id: i64,
         dispatch_id: &str,
         outcome: JobOutcome,
-    ) -> Result<Option<Job>, EngineError> {
-        let job = self.store.complete(job_id, dispatch_id, outcome).await?;
-        if let Some(job) = &job
-            && job.status == JobStatus::Pending
-        {
-            self.ensure_awake(job.name.clone()).await;
-        }
-        Ok(job)
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .store
+            .complete_worker_result(job_id, dispatch_id, outcome)
+            .await?)
     }
 
-    /// Connects a dispatcher result stream to durable completion and capacity
-    /// wakeups. Call once after constructing the engine.
     pub fn start_result_listener(&self) {
         let Some(mut events) = self.dispatcher.subscribe_events() else {
             return;
@@ -330,10 +327,20 @@ impl<
                         }
                         WorkerEvent::Result { queue_name, result } => {
                             let completion_engine = engine.clone();
+                            let completion_queue = queue_name.clone();
                             tokio::spawn(async move {
-                                let _ = completion_engine
-                                    .complete(result.job_id, &result.dispatch_id, result.outcome)
-                                    .await;
+                                if matches!(
+                                    completion_engine
+                                        .complete_worker_result(
+                                            result.job_id,
+                                            &result.dispatch_id,
+                                            result.outcome,
+                                        )
+                                        .await,
+                                    Ok(true)
+                                ) {
+                                    completion_engine.ensure_awake(completion_queue).await;
+                                }
                             });
                             engine.ensure_awake(queue_name).await;
                         }
@@ -343,10 +350,6 @@ impl<
                 }
             }
         });
-    }
-
-    pub async fn dispatch(&self, permit: ReservedDispatch, job: Job) -> Result<(), DispatchError> {
-        self.dispatcher.dispatch(permit, job).await
     }
 
     async fn ensure_awake(&self, queue: String) {
@@ -387,6 +390,33 @@ impl<
         });
     }
 
+    fn start_delivery_pump(&self, mut rx: mpsc::Receiver<DeliveryWork>) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            while let Some(work) = rx.recv().await {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    let DeliveryWork {
+                        permit,
+                        job,
+                        _budget,
+                    } = work;
+                    let queue_name = job.name.clone();
+                    let failed = engine
+                        .dispatcher
+                        .dispatch(permit, job.clone())
+                        .await
+                        .is_err();
+                    if failed && let Some(dispatch_id) = job.dispatch_id.as_deref() {
+                        let _ = engine.store.release_claim(job.id, dispatch_id).await;
+                    }
+
+                    engine.ensure_awake(queue_name).await;
+                });
+            }
+        });
+    }
+
     async fn drain_pass(&self, queues: HashSet<String>) {
         let count = self
             .scheduler
@@ -404,65 +434,56 @@ impl<
             self.wake_after_pass(queues);
             return;
         };
-        let mut permits_by_queue: HashMap<String, Vec<ReservedDispatch>> = HashMap::new();
+        let mut permits_by_queue: HashMap<String, Vec<(ReservedDispatch, OwnedSemaphorePermit)>> =
+            HashMap::new();
         for permit in permits {
-            permits_by_queue
-                .entry(permit.queue_name.clone())
-                .or_default()
-                .push(permit);
+            let queue_name = permit.queue_name.clone();
+            match self.scheduler.delivery_budget.clone().try_acquire_owned() {
+                Ok(budget) => permits_by_queue
+                    .entry(queue_name)
+                    .or_default()
+                    .push((permit, budget)),
+                Err(_) => self.dispatcher.release(permit).await,
+            }
         }
         let mut capped = HashSet::new();
         for queue_name in &queues {
             let Some(permits) = permits_by_queue.remove(queue_name) else {
                 continue;
             };
-            let Ok(Some(queue)) = self.store.get_queue(queue_name).await else {
-                for permit in permits {
-                    self.dispatcher.release(permit).await;
-                }
-                continue;
-            };
             let reserved = permits.len();
-            let Ok(jobs) = self
-                .store
-                .claim_batch(queue_name, queue.timeout_secs as i64, reserved)
-                .await
-            else {
-                for permit in permits {
+            let Ok(jobs) = self.store.claim_batch(queue_name, reserved).await else {
+                for (permit, _budget) in permits {
                     self.dispatcher.release(permit).await;
                 }
                 continue;
             };
-            // Filled every reserved permit and hit the ask ceiling: more pending
-            // may remain with free capacity still available.
             if jobs.len() == reserved && reserved == count {
                 capped.insert(queue_name.clone());
             }
             let mut permits = permits.into_iter();
-            let mut dispatches = Vec::with_capacity(jobs.len());
             for job in jobs {
-                let permit = permits
+                let (permit, budget) = permits
                     .next()
                     .expect("claim cannot exceed reserved permits");
-                dispatches.push((permit, job));
-            }
-            let dispatcher = self.dispatcher.clone();
-            let store = self.store.clone();
-            let max_in_flight = self.scheduler.options.max_in_flight;
-            futures_util::stream::iter(dispatches)
-                .for_each_concurrent(Some(max_in_flight), move |(permit, job)| {
-                    let dispatcher = dispatcher.clone();
-                    let store = store.clone();
-                    async move {
-                        if dispatcher.dispatch(permit, job.clone()).await.is_err()
-                            && let Some(dispatch_id) = job.dispatch_id.as_deref()
-                        {
-                            let _ = store.release_claim(job.id, dispatch_id).await;
-                        }
+                let work = DeliveryWork {
+                    permit,
+                    job,
+                    _budget: budget,
+                };
+                if let Err(error) = self.scheduler.delivery_tx.try_send(work) {
+                    let DeliveryWork { permit, job, .. } = match error {
+                        mpsc::error::TrySendError::Full(work)
+                        | mpsc::error::TrySendError::Closed(work) => work,
+                    };
+                    self.dispatcher.release(permit).await;
+                    if let Some(dispatch_id) = job.dispatch_id.as_deref() {
+                        let _ = self.store.release_claim(job.id, dispatch_id).await;
                     }
-                })
-                .await;
-            for permit in permits {
+                    self.ensure_awake(job.name).await;
+                }
+            }
+            for (permit, _budget) in permits {
                 self.dispatcher.release(permit).await;
             }
         }
@@ -497,6 +518,177 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone)]
+    struct TestStore {
+        pending: Arc<Mutex<VecDeque<Job>>>,
+        claims: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    impl TestStore {
+        fn with_pending(count: i64) -> Self {
+            let pending = (1..=count)
+                .map(|id| {
+                    let mut job = Job::new_pending("email", vec![]);
+                    job.id = id;
+                    job
+                })
+                .collect();
+            Self {
+                pending: Arc::new(Mutex::new(pending)),
+                claims: Arc::new(AtomicUsize::new(0)),
+                releases: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl DurableStore for TestStore {
+        async fn upsert_queue(&self, queue: JobQueue) -> Result<JobQueue, StoreError> {
+            Ok(queue)
+        }
+
+        async fn get_queue(&self, _name: &str) -> Result<Option<JobQueue>, StoreError> {
+            Ok(None)
+        }
+
+        async fn list_queues(&self) -> Result<Vec<JobQueue>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn enqueue(&self, job: Job) -> Result<Job, StoreError> {
+            self.pending.lock().unwrap().push_back(job.clone());
+            Ok(job)
+        }
+
+        async fn get_job(&self, job_id: i64) -> Result<Job, StoreError> {
+            Err(StoreError::NotFound(job_id))
+        }
+
+        async fn status(&self, job_id: i64) -> Result<JobStatus, StoreError> {
+            Err(StoreError::NotFound(job_id))
+        }
+
+        async fn claim_next(&self, _queue_name: &str) -> Result<Option<Job>, StoreError> {
+            let mut job = self.pending.lock().unwrap().pop_front();
+            if let Some(job) = &mut job {
+                job.status = JobStatus::Running;
+                job.execution_count = 1;
+                job.dispatch_id = Some(format!("dispatch-{}", job.id));
+                self.claims.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(job)
+        }
+
+        async fn release_claim(
+            &self,
+            _job_id: i64,
+            _dispatch_id: &str,
+        ) -> Result<bool, StoreError> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn recover_stale_leases(&self, _now: i64) -> Result<Vec<Job>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct TestPermit;
+
+    impl DispatchPermit for TestPermit {
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestDispatcher {
+        dispatches: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+        block_dispatch: bool,
+        fail_dispatch: bool,
+        unblock: Arc<tokio::sync::Notify>,
+    }
+
+    impl TestDispatcher {
+        fn blocking() -> Self {
+            Self {
+                dispatches: Arc::new(AtomicUsize::new(0)),
+                releases: Arc::new(AtomicUsize::new(0)),
+                block_dispatch: true,
+                fail_dispatch: false,
+                unblock: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                dispatches: Arc::new(AtomicUsize::new(0)),
+                releases: Arc::new(AtomicUsize::new(0)),
+                block_dispatch: false,
+                fail_dispatch: true,
+                unblock: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl WorkerDispatcher for TestDispatcher {
+        async fn reserve(
+            &self,
+            queues: Vec<QueueReservation>,
+        ) -> Result<Vec<ReservedDispatch>, DispatchError> {
+            Ok(queues
+                .into_iter()
+                .flat_map(|request| {
+                    (0..request.count).map(move |_| {
+                        ReservedDispatch::new(request.queue_name.clone(), Box::new(TestPermit))
+                    })
+                })
+                .collect())
+        }
+
+        async fn dispatch(
+            &self,
+            _permit: ReservedDispatch,
+            _job: Job,
+        ) -> Result<(), DispatchError> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            if self.block_dispatch {
+                self.unblock.notified().await;
+            }
+            if self.fail_dispatch {
+                Err(DispatchError::Internal("worker writer failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn release(&self, _permit: ReservedDispatch) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_for(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background task should make progress");
+    }
+
+    fn test_options(max_in_flight: usize) -> DispatchOptions {
+        DispatchOptions {
+            batch_size_max: 1,
+            max_in_flight,
+        }
+    }
 
     #[test]
     fn dispatch_options_reject_unsafe_claim_batches() {
@@ -505,5 +697,54 @@ mod tests {
             ..DispatchOptions::default()
         };
         assert!(options.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn scheduler_hands_off_durable_claim_without_waiting_for_writer_ack() {
+        let store = TestStore::with_pending(1);
+        let dispatcher = TestDispatcher::blocking();
+        let engine = Engine::with_dispatcher(store.clone(), dispatcher.clone(), test_options(1));
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.drain_pass(HashSet::from(["email".to_string()])),
+        )
+        .await
+        .expect("scheduler must not await the blocked writer");
+        assert_eq!(store.claims.load(Ordering::SeqCst), 1);
+        wait_for(&dispatcher.dispatches, 1).await;
+
+        dispatcher.unblock.notify_one();
+    }
+
+    #[tokio::test]
+    async fn delivery_budget_bounds_claims_across_scheduler_passes() {
+        let store = TestStore::with_pending(2);
+        let dispatcher = TestDispatcher::blocking();
+        let engine = Engine::with_dispatcher(store.clone(), dispatcher.clone(), test_options(1));
+        let queues = HashSet::from(["email".to_string()]);
+
+        engine.drain_pass(queues.clone()).await;
+        wait_for(&dispatcher.dispatches, 1).await;
+        engine.drain_pass(queues).await;
+
+        assert_eq!(store.claims.load(Ordering::SeqCst), 1);
+        assert!(dispatcher.releases.load(Ordering::SeqCst) >= 1);
+        dispatcher.unblock.notify_one();
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_releases_the_durable_claim() {
+        let store = TestStore::with_pending(1);
+        let dispatcher = TestDispatcher::failing();
+        let engine = Engine::with_dispatcher(store.clone(), dispatcher.clone(), test_options(1));
+
+        engine
+            .drain_pass(HashSet::from(["email".to_string()]))
+            .await;
+        wait_for(&store.releases, 1).await;
+
+        assert_eq!(dispatcher.dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(store.releases.load(Ordering::SeqCst), 1);
     }
 }

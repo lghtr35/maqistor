@@ -15,7 +15,7 @@ fn env(name: &str, default: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let concurrency = env("MAQISTOR_WORKER_CONCURRENCY", "8").parse()?;
+    let concurrency = env("MAQISTOR_WORKER_CONCURRENCY", "16").parse()?;
     let concurrency = NonZeroU32::new(concurrency)
         .ok_or("MAQISTOR_WORKER_CONCURRENCY must be greater than zero")?;
     let connection = WorkerConnection {

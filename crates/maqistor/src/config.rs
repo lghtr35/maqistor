@@ -23,7 +23,7 @@ pub struct AppConfig {
     pub queues: Vec<QueueConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistenceConfig {
     pub ingest_database: Option<String>,
@@ -36,19 +36,6 @@ pub struct PersistenceConfig {
     pub enqueue: BatchConfig,
     #[serde(default)]
     pub completion: BatchConfig,
-}
-
-impl Default for PersistenceConfig {
-    fn default() -> Self {
-        Self {
-            ingest_database: None,
-            results_database: None,
-            durability: DurabilityMode::default(),
-            startup: StartupPolicy::default(),
-            enqueue: BatchConfig::default(),
-            completion: BatchConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -117,20 +104,11 @@ impl PersistenceConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DispatchConfig {
     pub batch_size_max: Option<usize>,
     pub max_in_flight: Option<usize>,
-}
-
-impl Default for DispatchConfig {
-    fn default() -> Self {
-        Self {
-            batch_size_max: None,
-            max_in_flight: None,
-        }
-    }
 }
 
 impl DispatchConfig {
@@ -321,8 +299,7 @@ mod tests {
 
     #[test]
     fn database_paths_live_under_persistence() {
-        let defaults: AppConfig =
-            toml::from_str(&format!("{TLS}")).expect("parse");
+        let defaults: AppConfig = toml::from_str(TLS).expect("parse");
         assert_eq!(
             defaults.persistence.ingest_database_path(),
             "./data/maqistor-ingest.db"

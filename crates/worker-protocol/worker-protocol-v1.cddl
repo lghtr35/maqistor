@@ -1,0 +1,62 @@
+protocol-version = 1
+uuid = tstr .size 36
+byte-array = [* uint .le 255]
+
+worker-frame = {
+  protocol_version: protocol-version,
+  payload: worker-message
+}
+
+worker-message = register / registered / job-dispatch / job-result / heartbeat / error
+
+register = {
+  type: "register",
+  instance_id: uuid,
+  queue_name: tstr,
+  running_jobs: uint,
+  free_slots: uint
+}
+
+registered = {
+  type: "registered",
+  queue_name: tstr
+}
+
+job-dispatch = {
+  type: "job_dispatch",
+  job_id: int,
+  dispatch_id: tstr,
+  execution_count: uint,
+  payload: byte-array
+}
+
+job-result = {
+  type: "job_result",
+  job_id: int,
+  dispatch_id: tstr,
+  result: job-result-payload,
+  running_jobs: uint,
+  free_slots: uint
+}
+
+job-result-payload = succeeded / failed
+
+succeeded = {
+  status: "succeeded",
+  payload: byte-array
+}
+
+failed = {
+  status: "failed",
+  message: tstr
+}
+
+heartbeat = {
+  type: "heartbeat"
+}
+
+error = {
+  type: "error",
+  code: tstr,
+  message: tstr
+}

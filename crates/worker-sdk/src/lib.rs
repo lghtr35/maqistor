@@ -4,7 +4,7 @@ use std::{
 };
 
 use maqistor_worker_protocol::{
-    JobResult, ProtocolError, WireFrame, WorkerMessage, decode_frame, encode_frame, write_frame,
+    JobResult, ProtocolError, WireFrame, WorkerMessage, decode_frame, encode_frame,
 };
 use rustls::{
     ClientConfig, RootCertStore,
@@ -67,33 +67,6 @@ impl<Q: Queue> Worker<Q> {
             handler: Arc::new(move |job| Box::pin(handler(job))),
             _queue: PhantomData,
         }
-    }
-
-    pub fn start<W: std::io::Write>(
-        self,
-        mut stream: W,
-    ) -> Result<WorkerLifecycle<Q, W>, ProtocolError> {
-        let instance_id = Uuid::new_v4();
-        write_frame(
-            &mut stream,
-            &WireFrame::v1(WorkerMessage::Register {
-                instance_id,
-                queue_name: Q::NAME.into(),
-                running_jobs: 0,
-                free_slots: self.concurrency.get(),
-            }),
-        )?;
-        Ok(WorkerLifecycle {
-            stream: Mutex::new(stream),
-            handler: self.handler,
-            slots: Arc::new(Semaphore::new(self.concurrency.get() as usize)),
-            concurrency: self.concurrency.get(),
-            instance_id,
-            _queue: PhantomData,
-        })
-    }
-    pub fn connection(&self) -> &WorkerConnection {
-        &self.connection
     }
 
     pub async fn run(self) -> Result<(), WorkerRunError> {
@@ -283,98 +256,6 @@ impl<Q: Queue> AsyncWorkerLifecycle<Q> {
         })
         .await
     }
-}
-
-pub struct WorkerLifecycle<Q: Queue, W> {
-    stream: Mutex<W>,
-    handler: Handler<Q>,
-    slots: Arc<Semaphore>,
-    concurrency: u32,
-    instance_id: Uuid,
-    _queue: PhantomData<Q>,
-}
-impl<Q: Queue, W: std::io::Write> WorkerLifecycle<Q, W> {
-    pub async fn execute_dispatch(
-        &self,
-        job_id: i64,
-        dispatch_id: String,
-        execution_count: u32,
-        payload: Vec<u8>,
-    ) -> Result<(), WorkerExecutionError> {
-        let payload = match serde_json::from_slice(&payload) {
-            Ok(payload) => payload,
-            Err(err) => {
-                let message = format!("invalid job payload: {err}");
-                self.report_result(job_id, dispatch_id, Err(&message))
-                    .await?;
-                return Err(WorkerExecutionError::Handler(message));
-            }
-        };
-        self.execute(Job {
-            id: job_id,
-            dispatch_id,
-            execution_count,
-            payload,
-        })
-        .await
-    }
-
-    pub async fn execute(&self, job: Job<Q::Payload>) -> Result<(), WorkerExecutionError> {
-        let job_id = job.id;
-        let dispatch_id = job.dispatch_id.clone();
-        let slot = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| WorkerExecutionError::Stopped)?;
-        let result = (self.handler)(job).await;
-        drop(slot);
-        self.report_result(job_id, dispatch_id, result.as_ref())
-            .await?;
-        result.map(|_| ()).map_err(WorkerExecutionError::Handler)
-    }
-    pub fn instance_id(&self) -> Uuid {
-        self.instance_id
-    }
-    async fn report_result(
-        &self,
-        job_id: i64,
-        dispatch_id: String,
-        result: Result<&Vec<u8>, &String>,
-    ) -> Result<(), WorkerExecutionError> {
-        let free_slots = self.slots.available_permits() as u32;
-        let running_jobs = self.concurrency.saturating_sub(free_slots);
-        let result = match result {
-            Ok(payload) => JobResult::Succeeded {
-                payload: payload.clone(),
-            },
-            Err(message) => JobResult::Failed {
-                message: message.clone(),
-            },
-        };
-        let mut stream = self.stream.lock().await;
-        write_frame(
-            &mut *stream,
-            &WireFrame::v1(WorkerMessage::JobResult {
-                job_id,
-                dispatch_id,
-                result,
-                running_jobs,
-                free_slots,
-            }),
-        )
-        .map_err(WorkerExecutionError::Protocol)
-    }
-}
-#[derive(Debug, thiserror::Error)]
-pub enum WorkerExecutionError {
-    #[error("worker stopped")]
-    Stopped,
-    #[error("job handler failed: {0}")]
-    Handler(String),
-    #[error("protocol error: {0}")]
-    Protocol(ProtocolError),
 }
 
 #[derive(Debug, thiserror::Error)]
