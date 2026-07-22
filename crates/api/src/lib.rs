@@ -165,7 +165,7 @@ mod tests {
         async fn status(&self, id: i64) -> Result<JobStatus, StoreError> {
             Ok(self.get_job(id).await?.status)
         }
-        async fn claim_next(&self, _queue: &str, _lease: i64) -> Result<Option<Job>, StoreError> {
+        async fn claim_next(&self, _queue: &str) -> Result<Option<Job>, StoreError> {
             Ok(None)
         }
         async fn recover_stale_leases(&self, _now: i64) -> Result<Vec<Job>, StoreError> {

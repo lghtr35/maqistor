@@ -34,7 +34,6 @@ pub fn default_results_path(ingest: &Path) -> std::path::PathBuf {
     ingest.with_file_name(format!("{results_stem}.db"))
 }
 
-/// Read-write SQLite connection with schema migration applied.
 pub(crate) struct RwConnection {
     pub(crate) conn: Connection,
 }
@@ -143,6 +142,7 @@ pub(crate) fn apply_results_schema(conn: &Connection) -> Result<(), StoreError> 
             queue_name TEXT NOT NULL,
             status TEXT NOT NULL,
             execution_count INTEGER NOT NULL,
+            max_retries_at_claim INTEGER NOT NULL,
             lease_expires_at INTEGER,
             dispatch_id TEXT NOT NULL UNIQUE,
             result_payload BLOB,
@@ -175,9 +175,9 @@ pub(crate) struct IngestJobRow {
 pub(crate) struct AttemptRow {
     pub id: i64,
     pub job_id: i64,
-    pub queue_name: String,
     pub status: String,
     pub execution_count: u32,
+    pub max_retries_at_claim: u32,
     pub lease_expires_at: Option<i64>,
     pub dispatch_id: String,
     pub result_payload: Option<Vec<u8>>,
@@ -204,20 +204,23 @@ pub(crate) fn row_to_ingest_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ing
 
 pub(crate) fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
     let execution_count: i64 = row.get(4)?;
+    let max_retries_at_claim: i64 = row.get(5)?;
     Ok(AttemptRow {
         id: row.get(0)?,
         job_id: row.get(1)?,
-        queue_name: row.get(2)?,
         status: row.get(3)?,
         execution_count: u32::try_from(execution_count).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Integer, Box::new(err))
         })?,
-        lease_expires_at: row.get(5)?,
-        dispatch_id: row.get(6)?,
-        result_payload: row.get(7)?,
-        result_error: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        max_retries_at_claim: u32::try_from(max_retries_at_claim).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Integer, Box::new(err))
+        })?,
+        lease_expires_at: row.get(6)?,
+        dispatch_id: row.get(7)?,
+        result_payload: row.get(8)?,
+        result_error: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -283,9 +286,8 @@ pub(crate) fn new_dispatch_id() -> String {
 
 const INGEST_JOB_SELECT: &str =
     "SELECT id, queue_name, status, payload, execution_count, dispatch_id, created_at, updated_at FROM jobs";
-const ATTEMPT_SELECT: &str = "SELECT id, job_id, queue_name, status, execution_count, lease_expires_at, dispatch_id, result_payload, result_error, created_at, updated_at FROM job_attempts";
+const ATTEMPT_SELECT: &str = "SELECT id, job_id, queue_name, status, execution_count, max_retries_at_claim, lease_expires_at, dispatch_id, result_payload, result_error, created_at, updated_at FROM job_attempts";
 
-/// Four independent read-only SQLite connections.
 #[derive(Clone)]
 pub(crate) struct ReadPool {
     connections: Arc<Vec<Mutex<Connection>>>,

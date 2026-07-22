@@ -31,7 +31,7 @@ before starting Maqistor:
 
 ```bash
 sh benchmark/generate-certs.sh
-docker build -f benchmark/noop-worker/Dockerfile -t maqistor-benchmark-noop-worker:0.1.0 .
+docker build -f benchmark/noop-worker/Dockerfile -t maqistor-benchmark-noop-worker:0.1.3 .
 ```
 
 The worker connects to `host.docker.internal:17829` (Docker Desktop) and
@@ -43,7 +43,7 @@ certificate directory is ignored by Git.
 Prefer a **release** server for meaningful numbers:
 
 ```bash
-cargo build -p maqistor-dispatcher --release
+cargo build -p maqistor --release
 ```
 
 ## Start maqistor
@@ -107,9 +107,12 @@ python benchmark\run.py --mode full --open-qps 1000,2000 --duration 10 `
 | `--db` | `benchmark/data/maqistor-ingest.db` | Full only: ingest SQLite path (results = `maqistor-results.db`) |
 
 An open/full point is marked **stable** only when it has zero errors, achieves
-at least 98% of its offered QPS, and stays below the p99 guardrail. Full mode
-also requires a successful drain. The closed-loop peak is an observed ceiling
-for this machine and local oha client, not a universal SQLite limit.
+at least 98% of its offered QPS, and stays below the HTTP p99 guardrail. Full
+mode also requires a successful drain. This label does not enforce a full-cycle
+latency target or require zero backlog at the end of the offer window; judge
+full-cycle capacity from backlog, drain time, and cycle percentiles too. The
+closed-loop peak is an observed ceiling for this machine and local oha client,
+not a universal SQLite limit.
 
 Raw oha JSON lands under `benchmark/results/raw/`. Summaries are
 `summary-capacity-*.json` or `summary-capacity-full-*.json`.

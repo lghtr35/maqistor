@@ -31,14 +31,12 @@ pub enum WorkerMessage {
         running_jobs: u32,
         free_slots: u32,
     },
-    /// Sent by Maqistor to the single registered worker queue.
     JobDispatch {
         job_id: i64,
         dispatch_id: String,
         execution_count: u32,
         payload: Vec<u8>,
     },
-    /// Sent by a worker after the dispatched job finishes.
     JobResult {
         job_id: i64,
         dispatch_id: String,

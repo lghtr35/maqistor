@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use maqistor_engine::{
-    DurableStore, Job, JobOutcome, JobQueue, JobStatus, StoreError,
-};
+use maqistor_engine::{DurableStore, Job, JobOutcome, JobQueue, JobStatus, StoreError};
 
 use super::options::DurabilityMode;
 use super::common::{
@@ -10,9 +8,8 @@ use super::common::{
 };
 use super::ingest::{IngestClaimed, IngestHandle};
 use super::options::SqliteWriteOptions;
-use super::results::{ResultsHandle, RunningInsert};
+use super::results::{CompletionDisposition, ResultsHandle, RunningInsert};
 
-/// Cloneable async handle over split ingest/results SQLite stores.
 #[derive(Clone)]
 pub struct SqliteStore {
     ingest: IngestHandle,
@@ -88,23 +85,24 @@ impl SqliteStore {
     async fn claim_batch_inner(
         &self,
         queue_name: &str,
-        lease_duration_secs: i64,
         limit: usize,
     ) -> Result<Vec<Job>, StoreError> {
         let claimed = self.ingest.claim_batch(queue_name, limit).await?;
         if claimed.is_empty() {
             return Ok(Vec::new());
         }
-        let now = unix_now();
-        let lease_expires_at = now.saturating_add(lease_duration_secs.saturating_mul(1000));
+        let claimed_at = unix_now();
         let mut running_rows = Vec::with_capacity(claimed.len());
         let mut jobs = Vec::with_capacity(claimed.len());
         for row in &claimed {
+            let lease_expires_at = claimed_at
+                .saturating_add((row.timeout_secs as i64).saturating_mul(1000));
             running_rows.push(RunningInsert {
                 job_id: row.id,
                 queue_name: row.name.clone(),
                 dispatch_id: row.dispatch_id.clone(),
                 execution_count: row.execution_count,
+                max_retries_at_claim: row.max_retries,
                 lease_expires_at,
             });
             jobs.push(Self::job_from_claimed(row, lease_expires_at));
@@ -147,24 +145,16 @@ impl DurableStore for SqliteStore {
         Ok(self.composed_job(job_id).await?.status)
     }
 
-    async fn claim_next(
-        &self,
-        queue_name: &str,
-        lease_duration_secs: i64,
-    ) -> Result<Option<Job>, StoreError> {
-        Ok(self
-            .claim_batch(queue_name, lease_duration_secs, 1)
-            .await?
-            .pop())
+    async fn claim_next(&self, queue_name: &str) -> Result<Option<Job>, StoreError> {
+        Ok(self.claim_batch(queue_name, 1).await?.pop())
     }
 
     async fn claim_batch(
         &self,
         queue_name: &str,
-        lease_duration_secs: i64,
         limit: usize,
     ) -> Result<Vec<Job>, StoreError> {
-        self.claim_batch_inner(queue_name, lease_duration_secs, limit)
+        self.claim_batch_inner(queue_name, limit)
             .await
     }
 
@@ -174,24 +164,30 @@ impl DurableStore for SqliteStore {
         dispatch_id: &str,
         outcome: JobOutcome,
     ) -> Result<Option<Job>, StoreError> {
-        let ingest = self.ingest.ingest_row(job_id).await?;
-        let queue = self
-            .get_queue(&ingest.queue_name)
-            .await?
-            .ok_or_else(|| StoreError::QueueNotFound(ingest.queue_name.clone()))?;
-        let result = self
-            .results
-            .complete(job_id, dispatch_id, outcome, queue.max_retries)
-            .await?;
-        let Some(result) = result else {
+        let disposition = self.results.complete(job_id, dispatch_id, outcome).await?;
+        if disposition == CompletionDisposition::Ignored {
             return Ok(None);
-        };
-        if result.should_repend {
+        }
+        if disposition == CompletionDisposition::Repend {
             self.ingest.repend(job_id, dispatch_id).await?;
         }
-        let ingest = self.ingest.ingest_row(job_id).await?;
-        merge_job(ingest, Some(result.attempt)).map(Some)
+        self.composed_job(job_id).await.map(Some)
     }
+
+    async fn complete_worker_result(
+        &self,
+        job_id: i64,
+        dispatch_id: &str,
+        outcome: JobOutcome,
+    ) -> Result<bool, StoreError> {
+        let disposition = self.results.complete(job_id, dispatch_id, outcome).await?;
+        if disposition == CompletionDisposition::Repend {
+            self.ingest.repend(job_id, dispatch_id).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
 
     async fn release_claim(&self, job_id: i64, dispatch_id: &str) -> Result<bool, StoreError> {
         let ingest = self.ingest.ingest_row(job_id).await?;
@@ -204,15 +200,7 @@ impl DurableStore for SqliteStore {
     }
 
     async fn recover_stale_leases(&self, now: i64) -> Result<Vec<Job>, StoreError> {
-        let queues = self.list_queues().await?;
-        let max_retries_for: Vec<(String, u32)> = queues
-            .iter()
-            .map(|q| (q.name.clone(), q.max_retries))
-            .collect();
-        let recovered = self
-            .results
-            .recover_stale(now, max_retries_for)
-            .await?;
+        let recovered = self.results.recover_stale(now).await?;
         let mut jobs = Vec::with_capacity(recovered.len());
         for item in recovered {
             if item.should_repend {

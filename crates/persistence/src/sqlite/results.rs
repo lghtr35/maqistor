@@ -24,12 +24,15 @@ pub(crate) struct RunningInsert {
     pub queue_name: String,
     pub dispatch_id: String,
     pub execution_count: u32,
+    pub max_retries_at_claim: u32,
     pub lease_expires_at: i64,
 }
 
-pub(crate) struct CompleteOutcome {
-    pub attempt: AttemptRow,
-    pub should_repend: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionDisposition {
+    Ignored,
+    Completed,
+    Repend,
 }
 
 pub(crate) struct RecoveredStale {
@@ -47,8 +50,7 @@ enum ResultsRequest {
         job_id: i64,
         dispatch_id: String,
         outcome: JobOutcome,
-        max_retries: u32,
-        reply: oneshot::Sender<Result<Option<CompleteOutcome>, StoreError>>,
+        reply: oneshot::Sender<Result<CompletionDisposition, StoreError>>,
     },
     Abandon {
         job_id: i64,
@@ -57,7 +59,6 @@ enum ResultsRequest {
     },
     RecoverStale {
         now: i64,
-        max_retries_for: Vec<(String, u32)>,
         reply: oneshot::Sender<Result<Vec<RecoveredStale>, StoreError>>,
     },
 }
@@ -66,8 +67,7 @@ struct PendingCompletion {
     job_id: i64,
     dispatch_id: String,
     outcome: JobOutcome,
-    max_retries: u32,
-    reply: oneshot::Sender<Result<Option<CompleteOutcome>, StoreError>>,
+    reply: oneshot::Sender<Result<CompletionDisposition, StoreError>>,
 }
 
 struct BatchCommit {
@@ -95,16 +95,21 @@ impl ResultsConn {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         let now = unix_now();
-        for row in rows {
-            tx.execute(
+        let mut insert = tx
+            .prepare(
                 "INSERT INTO job_attempts (
-                    job_id, queue_name, status, execution_count, lease_expires_at,
-                    dispatch_id, created_at, updated_at
-                 ) VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?6)",
+                    job_id, queue_name, status, execution_count, max_retries_at_claim,
+                    lease_expires_at, dispatch_id, created_at, updated_at
+                 ) VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?7)",
+            )
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        for row in rows {
+            insert.execute(
                 params![
                     row.job_id,
                     row.queue_name,
                     row.execution_count,
+                    row.max_retries_at_claim,
                     row.lease_expires_at,
                     row.dispatch_id,
                     now,
@@ -112,70 +117,11 @@ impl ResultsConn {
             )
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         }
+        drop(insert);
         tx.commit()
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(())
     }
-}
-
-fn complete_one(
-    tx: &rusqlite::Transaction<'_>,
-    job_id: i64,
-    dispatch_id: &str,
-    outcome: &JobOutcome,
-    max_retries: u32,
-) -> Result<Option<CompleteOutcome>, StoreError> {
-    let attempt = tx
-        .query_row(
-            "SELECT id, job_id, queue_name, status, execution_count, lease_expires_at, dispatch_id, result_payload, result_error, created_at, updated_at
-             FROM job_attempts WHERE job_id = ?1 AND dispatch_id = ?2",
-            params![job_id, dispatch_id],
-            row_to_attempt,
-        )
-        .optional()
-        .map_err(|err| StoreError::Internal(err.to_string()))?;
-    let Some(attempt) = attempt else {
-        return Ok(None);
-    };
-    if attempt.status != "running" {
-        return Ok(None);
-    }
-    let now = unix_now();
-    let should_repend = match outcome {
-        JobOutcome::Succeeded(payload) => {
-            tx.execute(
-                "UPDATE job_attempts SET status = 'completed', lease_expires_at = NULL,
-                 result_payload = ?1, result_error = NULL, updated_at = ?2
-                 WHERE job_id = ?3 AND dispatch_id = ?4 AND status = 'running'",
-                params![payload, now, job_id, dispatch_id],
-            )
-            .map_err(|err| StoreError::Internal(err.to_string()))?;
-            false
-        }
-        JobOutcome::Failed(message) => {
-            let retry = attempt.execution_count < max_retries.saturating_add(1);
-            tx.execute(
-                "UPDATE job_attempts SET status = 'failed', lease_expires_at = NULL,
-                 result_error = ?1, updated_at = ?2
-                 WHERE job_id = ?3 AND dispatch_id = ?4 AND status = 'running'",
-                params![message, now, job_id, dispatch_id],
-            )
-            .map_err(|err| StoreError::Internal(err.to_string()))?;
-            retry
-        }
-    };
-    let updated = tx
-        .query_row(
-            "SELECT id, job_id, queue_name, status, execution_count, lease_expires_at, dispatch_id, result_payload, result_error, created_at, updated_at
-             FROM job_attempts WHERE job_id = ?1 AND dispatch_id = ?2",
-            params![job_id, dispatch_id],
-            row_to_attempt,
-        )
-        .map_err(|err| StoreError::Internal(err.to_string()))?;
-    Ok(Some(CompleteOutcome {
-        attempt: updated,
-        should_repend,
-    }))
 }
 
 impl ResultsConn {
@@ -185,21 +131,61 @@ impl ResultsConn {
         }
         let started = Instant::now();
         let count = batch.len();
-        let result = (|| -> Result<Vec<Option<CompleteOutcome>>, StoreError> {
+        let result = (|| -> Result<Vec<CompletionDisposition>, StoreError> {
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
+            let mut complete_success = tx
+                .prepare(
+                    "UPDATE job_attempts SET status = 'completed', lease_expires_at = NULL,
+                     result_payload = ?1, result_error = NULL, updated_at = ?2
+                     WHERE job_id = ?3 AND dispatch_id = ?4 AND status = 'running'",
+                )
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            let mut complete_failure = tx
+                .prepare(
+                    "UPDATE job_attempts SET status = 'failed', lease_expires_at = NULL,
+                     result_error = ?1, updated_at = ?2
+                     WHERE job_id = ?3 AND dispatch_id = ?4 AND status = 'running'
+                     RETURNING execution_count, max_retries_at_claim",
+                )
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            let now = unix_now();
             let mut results = Vec::with_capacity(batch.len());
             for pending in &batch {
-                results.push(complete_one(
-                    &tx,
-                    pending.job_id,
-                    &pending.dispatch_id,
-                    &pending.outcome,
-                    pending.max_retries,
-                )?);
+                let result = match &pending.outcome {
+                    JobOutcome::Succeeded(payload) => {
+                        let updated = complete_success
+                            .execute(params![payload, now, pending.job_id, pending.dispatch_id])
+                            .map_err(|err| StoreError::Internal(err.to_string()))?;
+                        if updated == 0 {
+                            CompletionDisposition::Ignored
+                        } else {
+                            CompletionDisposition::Completed
+                        }
+                    }
+                    JobOutcome::Failed(message) => {
+                        let attempt = complete_failure
+                            .query_row(
+                                params![message, now, pending.job_id, pending.dispatch_id],
+                                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                            )
+                            .optional()
+                            .map_err(|err| StoreError::Internal(err.to_string()))?;
+                        match attempt {
+                            Some((execution_count, max_retries)) if execution_count <= max_retries => {
+                                CompletionDisposition::Repend
+                            }
+                            Some(_) => CompletionDisposition::Completed,
+                            None => CompletionDisposition::Ignored,
+                        }
+                    }
+                };
+                results.push(result);
             }
+            drop(complete_failure);
+            drop(complete_success);
             tx.commit()
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             Ok(results)
@@ -238,12 +224,12 @@ impl ResultsConn {
     fn recover_stale(
         &mut self,
         now: i64,
-        max_retries_for: &[(String, u32)],
     ) -> Result<Vec<RecoveredStale>, StoreError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, job_id, queue_name, status, execution_count, lease_expires_at, dispatch_id, result_payload, result_error, created_at, updated_at
+                "SELECT id, job_id, queue_name, status, execution_count, max_retries_at_claim,
+                        lease_expires_at, dispatch_id, result_payload, result_error, created_at, updated_at
                  FROM job_attempts
                  WHERE status = 'running'
                    AND lease_expires_at IS NOT NULL
@@ -258,12 +244,7 @@ impl ResultsConn {
 
         let mut recovered = Vec::with_capacity(stale.len());
         for attempt in stale {
-            let max_retries = max_retries_for
-                .iter()
-                .find(|(name, _)| name == &attempt.queue_name)
-                .map(|(_, retries)| *retries)
-                .unwrap_or(0);
-            let should_repend = attempt.execution_count < max_retries.saturating_add(1);
+            let should_repend = attempt.execution_count <= attempt.max_retries_at_claim;
             self.conn
                 .execute(
                     "UPDATE job_attempts SET status = 'failed', lease_expires_at = NULL,
@@ -290,14 +271,12 @@ impl ResultsConn {
                 job_id,
                 dispatch_id,
                 outcome,
-                max_retries,
                 reply,
             } => {
                 let _ = self.complete_batch(vec![PendingCompletion {
                     job_id,
                     dispatch_id,
                     outcome,
-                    max_retries,
                     reply,
                 }]);
             }
@@ -308,12 +287,8 @@ impl ResultsConn {
             } => {
                 let _ = reply.send(self.abandon(job_id, &dispatch_id));
             }
-            ResultsRequest::RecoverStale {
-                now,
-                max_retries_for,
-                reply,
-            } => {
-                let _ = reply.send(self.recover_stale(now, &max_retries_for));
+            ResultsRequest::RecoverStale { now, reply } => {
+                let _ = reply.send(self.recover_stale(now));
             }
         }
     }
@@ -394,18 +369,17 @@ impl ResultsHandle {
         job_id: i64,
         dispatch_id: &str,
         outcome: JobOutcome,
-        max_retries: u32,
-    ) -> Result<Option<CompleteOutcome>, StoreError> {
+    ) -> Result<CompletionDisposition, StoreError> {
         let dispatch_id = dispatch_id.to_string();
         self.call(|reply| ResultsRequest::Complete {
             job_id,
             dispatch_id,
             outcome,
-            max_retries,
             reply,
         })
         .await
     }
+
 
     pub(crate) async fn abandon(&self, job_id: i64, dispatch_id: &str) -> Result<(), StoreError> {
         let dispatch_id = dispatch_id.to_string();
@@ -420,13 +394,8 @@ impl ResultsHandle {
     pub(crate) async fn recover_stale(
         &self,
         now: i64,
-        max_retries_for: Vec<(String, u32)>,
     ) -> Result<Vec<RecoveredStale>, StoreError> {
-        self.call(|reply| ResultsRequest::RecoverStale {
-            now,
-            max_retries_for,
-            reply,
-        })
+        self.call(|reply| ResultsRequest::RecoverStale { now, reply })
         .await
     }
 
@@ -453,7 +422,6 @@ impl ResultsQueues {
                 job_id,
                 dispatch_id,
                 outcome,
-                max_retries,
                 reply,
             } => {
                 if self.complete.is_empty() {
@@ -463,7 +431,6 @@ impl ResultsQueues {
                     job_id,
                     dispatch_id,
                     outcome,
-                    max_retries,
                     reply,
                 });
             }
@@ -570,7 +537,6 @@ async fn run_complete_turn(
                 job_id,
                 dispatch_id,
                 outcome,
-                max_retries,
                 reply,
             })) => {
                 controller.observe_request(Instant::now());
@@ -578,7 +544,6 @@ async fn run_complete_turn(
                     job_id,
                     dispatch_id,
                     outcome,
-                    max_retries,
                     reply,
                 });
             }

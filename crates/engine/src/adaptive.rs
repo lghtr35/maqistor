@@ -1,5 +1,3 @@
-/// Exponentially weighted moving average used by adaptive scheduling and
-/// persistence policies.
 #[derive(Debug, Clone, Copy)]
 pub struct Ewma {
     alpha: f64,
@@ -29,7 +27,6 @@ impl Ewma {
     }
 }
 
-/// Confirms a non-zero control direction only after repeated observations.
 #[derive(Debug, Default)]
 pub struct DirectionStreak {
     direction: i8,
@@ -58,8 +55,6 @@ impl DirectionStreak {
     }
 }
 
-/// Shared bounded batch-size controller. Domain wrappers decide whether a
-/// sample means growth, backoff, or no change and delegate the adjustment here.
 #[derive(Debug)]
 pub struct AdaptiveBatch {
     min: usize,
@@ -90,8 +85,6 @@ impl AdaptiveBatch {
         self.size = size.clamp(self.min, self.max);
     }
 
-    /// Applies a confirmed direction: positive probes upward and negative
-    /// backs off. Returns true only when the batch size changed.
     pub fn observe_direction(&mut self, direction: i8) -> bool {
         if !self.direction.confirm(direction) {
             return false;

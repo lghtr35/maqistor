@@ -14,7 +14,7 @@ use maqistor_engine::{Job, JobQueue, JobStatus, MAX_CLAIM_BATCH_SIZE, StoreError
 
 use super::adaptive::{AdaptiveBatchController, FlushReason};
 use super::common::{
-    IngestJobRow, ReadPool, RwConnection, apply_ingest_schema, new_dispatch_id, row_to_ingest_job,
+    IngestJobRow, ReadPool, RwConnection, apply_ingest_schema, new_dispatch_id,
     row_to_queue, unix_now,
 };
 use super::options::{DurabilityMode, SqliteWriteOptions};
@@ -50,6 +50,8 @@ pub(crate) struct IngestClaimed {
     pub name: String,
     pub payload: Vec<u8>,
     pub execution_count: u32,
+    pub max_retries: u32,
+    pub timeout_secs: u64,
     pub dispatch_id: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -230,52 +232,78 @@ impl IngestConn {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| StoreError::Internal(err.to_string()))?;
-        let ids: Vec<i64> = {
+        struct PendingClaim {
+            id: i64,
+            name: String,
+            payload: Vec<u8>,
+            execution_count: i64,
+            created_at: i64,
+            max_retries: i64,
+            timeout_secs: i64,
+        }
+        let pending: Vec<PendingClaim> = {
             let mut statement = tx
                 .prepare(
-                    "SELECT id FROM jobs WHERE queue_name = ?1 AND status = 'pending'
-                     ORDER BY created_at ASC, id ASC LIMIT ?2",
+                    "SELECT jobs.id, jobs.queue_name, jobs.payload, jobs.execution_count,
+                            jobs.created_at, job_queues.max_retries, job_queues.timeout_secs
+                     FROM jobs JOIN job_queues ON job_queues.name = jobs.queue_name
+                     WHERE jobs.queue_name = ?1 AND jobs.status = 'pending'
+                     ORDER BY jobs.created_at ASC, jobs.id ASC LIMIT ?2",
                 )
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             statement
-                .query_map(params![queue_name, limit as i64], |row| row.get(0))
+                .query_map(params![queue_name, limit as i64], |row| {
+                    Ok(PendingClaim {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        payload: row.get(2)?,
+                        execution_count: row.get(3)?,
+                        created_at: row.get(4)?,
+                        max_retries: row.get(5)?,
+                        timeout_secs: row.get(6)?,
+                    })
+                })
                 .map_err(|err| StoreError::Internal(err.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| StoreError::Internal(err.to_string()))?
         };
         let now = unix_now();
-        let mut claimed = Vec::with_capacity(ids.len());
-        for id in ids {
+        let mut update = tx
+            .prepare(
+                "UPDATE jobs SET status = 'claimed', dispatch_id = ?1,
+                 execution_count = execution_count + 1, updated_at = ?2
+                 WHERE id = ?3 AND status = 'pending'",
+            )
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        let mut claimed = Vec::with_capacity(pending.len());
+        for row in pending {
+            let execution_count = u32::try_from(row.execution_count)
+                .map_err(|err| StoreError::Internal(err.to_string()))?
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Internal("job execution count overflow".into()))?;
+            let max_retries = u32::try_from(row.max_retries)
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            let timeout_secs = u64::try_from(row.timeout_secs)
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
             let dispatch_id = new_dispatch_id();
-            let updated = tx
-                .execute(
-                    "UPDATE jobs SET status = 'claimed', dispatch_id = ?1,
-                     execution_count = execution_count + 1, updated_at = ?2
-                     WHERE id = ?3 AND status = 'pending'",
-                    params![dispatch_id, now, id],
-                )
+            let updated = update
+                .execute(params![dispatch_id, now, row.id])
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             if updated == 1 {
-                let row = tx
-                    .query_row(
-                        "SELECT id, queue_name, status, payload, execution_count, dispatch_id,
-                                created_at, updated_at
-                         FROM jobs WHERE id = ?1",
-                        params![id],
-                        row_to_ingest_job,
-                    )
-                    .map_err(|err| StoreError::Internal(err.to_string()))?;
                 claimed.push(IngestClaimed {
                     id: row.id,
-                    name: row.queue_name,
+                    name: row.name,
                     payload: row.payload,
-                    execution_count: row.execution_count,
+                    execution_count,
+                    max_retries,
+                    timeout_secs,
                     dispatch_id,
                     created_at: row.created_at,
                     updated_at: now,
                 });
             }
         }
+        drop(update);
         tx.commit()
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(claimed)
@@ -423,6 +451,7 @@ impl IngestHandle {
         .await
     }
 
+
     pub(crate) async fn ingest_row(&self, job_id: i64) -> Result<IngestJobRow, StoreError> {
         self.reads.ingest_job(job_id).await
     }
@@ -548,7 +577,9 @@ async fn run_ingest_turn(
             Ok(Some(request)) => {
                 let preempt = matches!(
                     request,
-                    IngestRequest::ClaimBatch { .. } | IngestRequest::UpsertQueue { .. } | IngestRequest::Repend { .. }
+            IngestRequest::ClaimBatch { .. }
+                | IngestRequest::UpsertQueue { .. }
+                | IngestRequest::Repend { .. }
                 );
                 queues.push(request);
                 if preempt {

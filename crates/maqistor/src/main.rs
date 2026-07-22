@@ -99,7 +99,6 @@ async fn main() -> anyhow::Result<()> {
         db_results = %config.persistence.results_database_path(),
         queues = config.queues.len(),
         worker_listen = %worker_addr,
-        worker_registry = ?worker_registry.snapshot().await.len(),
         durability = ?config.persistence.durability,
         startup = ?config.persistence.startup,
         "maqistor listening"

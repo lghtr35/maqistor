@@ -2,9 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::*;
-use maqistor_engine::{
-    DurableStore, Ewma, Job, JobOutcome, JobQueue, JobStatus, StoreError,
-};
+use maqistor_engine::{DurableStore, Ewma, Job, JobOutcome, JobQueue, JobStatus, StoreError};
 use uuid::Uuid;
 
 fn cleanup_store(path: &Path) {
@@ -57,8 +55,10 @@ async fn persists_queues_and_jobs_across_reopen() {
 async fn claim_and_recover_stale_lease() {
     let path = std::env::temp_dir().join(format!("maqistor-test-{}.db", Uuid::new_v4()));
     let store = SqliteStore::open(&path).expect("open store");
+    let mut queue = JobQueue::new("email");
+    queue.timeout_secs = 30;
     store
-        .upsert_queue(JobQueue::new("email"))
+        .upsert_queue(queue)
         .await
         .expect("upsert queue");
     let job = store
@@ -67,7 +67,7 @@ async fn claim_and_recover_stale_lease() {
         .expect("enqueue");
 
     let claimed = store
-        .claim_next("email", 30)
+        .claim_next("email")
         .await
         .expect("claim")
         .expect("claimed job");
@@ -108,7 +108,7 @@ async fn fifo_claims_increment_counts_and_fence_results() {
     let first = store.enqueue(first).await.unwrap();
     let second = store.enqueue(second).await.unwrap();
 
-    let claimed = store.claim_batch("email", 30, 64).await.unwrap();
+    let claimed = store.claim_batch("email", 64).await.unwrap();
     assert_eq!(
         claimed.iter().map(|job| job.id).collect::<Vec<_>>(),
         vec![first.id, second.id]
@@ -138,7 +138,7 @@ async fn fifo_claims_increment_counts_and_fence_results() {
     assert_eq!(retry.execution_count, 1);
     assert_eq!(retry.created_at, 10);
 
-    let retry = store.claim_next("email", 30).await.unwrap().unwrap();
+    let retry = store.claim_next("email").await.unwrap().unwrap();
     assert_eq!(retry.id, first.id);
     assert_eq!(retry.execution_count, 2);
     let terminal = store
@@ -152,6 +152,70 @@ async fn fifo_claims_increment_counts_and_fence_results() {
         .unwrap();
     assert_eq!(terminal.status, JobStatus::Failed);
     assert_eq!(terminal.result_error.as_deref(), Some("final"));
+}
+
+#[tokio::test]
+async fn retries_use_policy_snapshotted_when_claimed() {
+    let path = std::env::temp_dir().join(format!("maqistor-test-{}.db", Uuid::new_v4()));
+    let store = SqliteStore::open(&path).unwrap();
+    let mut queue = JobQueue::new("email");
+    queue.max_retries = 1;
+    store.upsert_queue(queue.clone()).await.unwrap();
+    let job = store
+        .enqueue(Job::new_pending("email", vec![]))
+        .await
+        .unwrap();
+
+    let first = store.claim_next("email").await.unwrap().unwrap();
+    queue.max_retries = 0;
+    store.upsert_queue(queue).await.unwrap();
+    let retry = store
+        .complete(
+            first.id,
+            first.dispatch_id.as_deref().unwrap(),
+            JobOutcome::Failed("retry under snapshotted policy".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.status, JobStatus::Pending);
+
+    let second = store.claim_next("email").await.unwrap().unwrap();
+    assert_eq!(second.id, job.id);
+    assert_eq!(second.execution_count, 2);
+    let terminal = store
+        .complete(
+            second.id,
+            second.dispatch_id.as_deref().unwrap(),
+            JobOutcome::Failed("new policy disallows retry".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, JobStatus::Failed);
+}
+
+#[tokio::test]
+async fn worker_result_completion_is_fenced_and_lightweight() {
+    let path = std::env::temp_dir().join(format!("maqistor-test-{}.db", Uuid::new_v4()));
+    let store = SqliteStore::open(&path).unwrap();
+    store.upsert_queue(JobQueue::new("email")).await.unwrap();
+    let job = store
+        .enqueue(Job::new_pending("email", vec![]))
+        .await
+        .unwrap();
+    let claimed = store.claim_next("email").await.unwrap().unwrap();
+    let dispatch_id = claimed.dispatch_id.as_deref().unwrap();
+
+    assert!(!store
+        .complete_worker_result(job.id, dispatch_id, JobOutcome::Succeeded(vec![]))
+        .await
+        .unwrap());
+    assert!(!store
+        .complete_worker_result(job.id, dispatch_id, JobOutcome::Succeeded(vec![]))
+        .await
+        .unwrap());
+    assert_eq!(store.get_job(job.id).await.unwrap().status, JobStatus::Completed);
 }
 
 #[tokio::test]
@@ -170,7 +234,7 @@ async fn fifo_uses_timestamp_then_id_and_preserves_position_after_release() {
     let first = store.enqueue(first).await.unwrap();
     let second = store.enqueue(second).await.unwrap();
 
-    let claimed = store.claim_batch("email", 30, 64).await.unwrap();
+    let claimed = store.claim_batch("email", 64).await.unwrap();
     assert_eq!(
         claimed.iter().map(|job| job.id).collect::<Vec<_>>(),
         vec![first.id, second.id, later.id]
@@ -188,7 +252,7 @@ async fn fifo_uses_timestamp_then_id_and_preserves_position_after_release() {
         .await
         .unwrap();
 
-    let reclaimed = store.claim_batch("email", 30, 64).await.unwrap();
+    let reclaimed = store.claim_batch("email", 64).await.unwrap();
     assert_eq!(
         reclaimed.iter().map(|job| job.id).collect::<Vec<_>>(),
         vec![first.id, second.id, later.id]
@@ -207,7 +271,7 @@ async fn claim_batch_exceeds_sixty_four_and_persists_success_payload() {
             .unwrap();
     }
 
-    let claimed = store.claim_batch("email", 30, 100).await.unwrap();
+    let claimed = store.claim_batch("email", 100).await.unwrap();
     assert_eq!(claimed.len(), 65);
     let completed = store
         .complete(
@@ -220,7 +284,7 @@ async fn claim_batch_exceeds_sixty_four_and_persists_success_payload() {
         .unwrap();
     assert_eq!(completed.result_payload.as_deref(), Some(&b"result"[..]));
     assert_eq!(completed.result_error, None);
-    assert!(store.claim_next("email", 30).await.unwrap().is_none());
+    assert!(store.claim_next("email").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -246,7 +310,7 @@ async fn completion_results_share_a_bounded_group_commit() {
         .enqueue(Job::new_pending("email", vec![2]))
         .await
         .unwrap();
-    let claimed = store.claim_batch("email", 30, 2).await.unwrap();
+    let claimed = store.claim_batch("email", 2).await.unwrap();
     let first = claimed[0].clone();
     let second = claimed[1].clone();
     let one = tokio::spawn({
@@ -302,7 +366,7 @@ async fn enqueue_is_not_starved_while_a_completion_batch_is_open() {
         .enqueue(Job::new_pending("email", vec![1]))
         .await
         .unwrap();
-    let claimed = store.claim_next("email", 30).await.unwrap().unwrap();
+    let claimed = store.claim_next("email").await.unwrap().unwrap();
     let complete = tokio::spawn({
         let store = store.clone();
         let dispatch_id = claimed.dispatch_id.clone().unwrap();
@@ -350,7 +414,7 @@ async fn claim_preempts_an_open_ingest_batch() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let claimed = tokio::time::timeout(
         Duration::from_millis(100),
-        store.claim_next("email", 30),
+        store.claim_next("email"),
     )
     .await
     .expect("claim must preempt ingest collection instead of waiting for the 500ms deadline")
@@ -384,7 +448,7 @@ async fn claim_flushes_after_fair_ingest_budget() {
 
     let claim = tokio::spawn({
         let store = store.clone();
-        async move { store.claim_next("email", 30).await }
+        async move { store.claim_next("email").await }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -437,7 +501,7 @@ async fn completion_batches_fill_under_mixed_ingest() {
             .await
             .unwrap();
     }
-    let claimed = store.claim_batch("email", 30, 8).await.unwrap();
+    let claimed = store.claim_batch("email", 8).await.unwrap();
     assert_eq!(claimed.len(), 8);
 
     let mut completes = Vec::new();
@@ -491,7 +555,7 @@ async fn completes_progress_under_continuous_ingest() {
             .await
             .unwrap();
     }
-    let claimed = store.claim_batch("email", 30, 4).await.unwrap();
+    let claimed = store.claim_batch("email", 4).await.unwrap();
     let ingest = tokio::spawn({
         let store = store.clone();
         async move {
@@ -555,7 +619,7 @@ async fn ingest_progresses_under_mixed_complete_traffic() {
             .await
             .unwrap();
     }
-    let claimed = store.claim_batch("email", 30, 8).await.unwrap();
+    let claimed = store.claim_batch("email", 8).await.unwrap();
 
     let mut completes = Vec::new();
     for job in claimed {
@@ -639,7 +703,7 @@ async fn zero_retries_allows_exactly_one_execution() {
         .enqueue(Job::new_pending("email", vec![]))
         .await
         .unwrap();
-    let claimed = store.claim_next("email", 30).await.unwrap().unwrap();
+    let claimed = store.claim_next("email").await.unwrap().unwrap();
     let done = store
         .complete(
             job.id,
@@ -651,7 +715,7 @@ async fn zero_retries_allows_exactly_one_execution() {
         .unwrap();
     assert_eq!(done.status, JobStatus::Failed);
     assert_eq!(done.execution_count, 1);
-    assert!(store.claim_next("email", 30).await.unwrap().is_none());
+    assert!(store.claim_next("email").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -666,7 +730,7 @@ async fn stale_leases_obey_retry_limit_without_incrementing_on_requeue() {
         .await
         .unwrap();
 
-    let first = store.claim_next("email", 1).await.unwrap().unwrap();
+    let first = store.claim_next("email").await.unwrap().unwrap();
     let recovered = store
         .recover_stale_leases(first.lease_expires_at.unwrap() + 1)
         .await
@@ -674,7 +738,7 @@ async fn stale_leases_obey_retry_limit_without_incrementing_on_requeue() {
     assert_eq!(recovered[0].status, JobStatus::Pending);
     assert_eq!(recovered[0].execution_count, 1);
 
-    let second = store.claim_next("email", 1).await.unwrap().unwrap();
+    let second = store.claim_next("email").await.unwrap().unwrap();
     assert_eq!(second.id, job.id);
     assert_eq!(second.execution_count, 2);
     let recovered = store
