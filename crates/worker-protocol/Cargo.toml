@@ -1,0 +1,10 @@
+[package]
+name = "maqistor-worker-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_cbor.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

@@ -119,6 +119,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::{body::Body, http::Request};
+    use maqistor_dispatcher::{RegistryDispatcher, WorkerRegistry};
     use maqistor_engine::{Job, JobQueue, JobStatus, StoreError};
     use tower::ServiceExt;
 
@@ -176,7 +177,11 @@ mod tests {
     async fn http_submission_is_persisted_through_engine() {
         let store = MemoryStore::default();
         store.upsert_queue(JobQueue::new("email")).await.unwrap();
-        let app = router(Engine::new(store.clone()));
+        let app = router(Engine::with_dispatcher(
+            store.clone(),
+            RegistryDispatcher::new(WorkerRegistry::default()),
+            maqistor_engine::DispatchOptions::default(),
+        ));
         let request = Request::post("/jobs")
             .header("content-type", "application/json")
             .body(Body::from(

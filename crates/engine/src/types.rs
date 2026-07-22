@@ -9,8 +9,11 @@ pub struct Job {
     pub name: String,
     pub status: JobStatus,
     pub payload: Vec<u8>,
-    pub attempt: u32,
+    pub execution_count: u32,
     pub lease_expires_at: Option<i64>,
+    pub dispatch_id: Option<String>,
+    pub result_payload: Option<Vec<u8>>,
+    pub result_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -23,8 +26,11 @@ impl Job {
             name: name.into(),
             status: JobStatus::Pending,
             payload,
-            attempt: 0,
+            execution_count: 0,
             lease_expires_at: None,
+            dispatch_id: None,
+            result_payload: None,
+            result_error: None,
             created_at: now,
             updated_at: now,
         }
@@ -34,9 +40,11 @@ impl Job {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct JobQueue {
     pub name: String,
-    pub concurrency: u32,
     pub max_retries: u32,
+    pub timeout_secs: u64,
+    /// Unix time in milliseconds.
     pub created_at: i64,
+    /// Unix time in milliseconds.
     pub updated_at: i64,
 }
 
@@ -45,8 +53,8 @@ impl JobQueue {
         let now = unix_now();
         Self {
             name: name.into(),
-            concurrency: 1,
             max_retries: 3,
+            timeout_secs: 60,
             created_at: now,
             updated_at: now,
         }
@@ -97,9 +105,10 @@ pub enum StoreError {
     Internal(String),
 }
 
-pub(crate) fn unix_now() -> i64 {
+/// Current unix time in milliseconds.
+pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
-        .as_secs() as i64
+        .as_millis() as i64
 }

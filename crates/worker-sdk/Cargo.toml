@@ -1,0 +1,15 @@
+[package]
+name = "maqistor-worker-sdk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maqistor-worker-protocol = { path = "../worker-protocol" }
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
