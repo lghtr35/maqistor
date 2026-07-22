@@ -4,19 +4,32 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ToSql, TransactionBehavior, params, params_from_iter};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 use maqistor_engine::{JobOutcome, StoreError};
 
 use super::adaptive::{AdaptiveBatchController, FlushReason};
+use super::bulk::{self, ROWS_PER_STATEMENT};
 use super::common::{
     AttemptRow, ReadPool, RwConnection, apply_results_schema, row_to_attempt, unix_now,
 };
 use super::options::{DurabilityMode, SqliteWriteOptions};
 
 const CHANNEL_CAPACITY: usize = 1024;
+
+const ATTEMPTS_INSERT_COLUMNS: &[&str] = &[
+    "job_id",
+    "queue_name",
+    "status",
+    "execution_count",
+    "max_retries_at_claim",
+    "lease_expires_at",
+    "dispatch_id",
+    "created_at",
+    "updated_at",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunningInsert {
@@ -95,36 +108,31 @@ impl ResultsConn {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         let now = unix_now();
-        let mut insert = tx
-            .prepare(
-                "INSERT INTO job_attempts (
-                    job_id, queue_name, status, execution_count, max_retries_at_claim,
-                    lease_expires_at, dispatch_id, created_at, updated_at
-                 ) VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?7)",
-            )
-            .map_err(|err| StoreError::Internal(err.to_string()))?;
-        for row in rows {
-            insert.execute(
-                params![
-                    row.job_id,
-                    row.queue_name,
-                    row.execution_count,
-                    row.max_retries_at_claim,
-                    row.lease_expires_at,
-                    row.dispatch_id,
-                    now,
-                ],
-            )
-            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        let status = "running";
+        for chunk in rows.chunks(ROWS_PER_STATEMENT) {
+            let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 9);
+            for row in chunk {
+                values.push(&row.job_id);
+                values.push(&row.queue_name);
+                values.push(&status);
+                values.push(&row.execution_count);
+                values.push(&row.max_retries_at_claim);
+                values.push(&row.lease_expires_at);
+                values.push(&row.dispatch_id);
+                values.push(&now);
+                values.push(&now);
+            }
+            bulk::execute_cached_tx(
+                &tx,
+                &bulk::insert_sql("job_attempts", ATTEMPTS_INSERT_COLUMNS, chunk.len()),
+                params_from_iter(values),
+            )?;
         }
-        drop(insert);
         tx.commit()
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(())
     }
-}
 
-impl ResultsConn {
     fn complete_batch(&mut self, batch: Vec<PendingCompletion>) -> Option<BatchCommit> {
         if batch.is_empty() {
             return None;
@@ -136,59 +144,119 @@ impl ResultsConn {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
-            let mut complete_success = tx
-                .prepare(
-                    "UPDATE job_attempts SET status = 'completed', lease_expires_at = NULL,
-                     result_payload = ?1, result_error = NULL, updated_at = ?2
-                     WHERE job_id = ?3 AND dispatch_id = ?4 AND status = 'running'",
-                )
-                .map_err(|err| StoreError::Internal(err.to_string()))?;
-            let mut complete_failure = tx
-                .prepare(
-                    "UPDATE job_attempts SET status = 'failed', lease_expires_at = NULL,
-                     result_error = ?1, updated_at = ?2
-                     WHERE job_id = ?3 AND dispatch_id = ?4 AND status = 'running'
-                     RETURNING execution_count, max_retries_at_claim",
-                )
-                .map_err(|err| StoreError::Internal(err.to_string()))?;
             let now = unix_now();
-            let mut results = Vec::with_capacity(batch.len());
-            for pending in &batch {
-                let result = match &pending.outcome {
-                    JobOutcome::Succeeded(payload) => {
-                        let updated = complete_success
-                            .execute(params![payload, now, pending.job_id, pending.dispatch_id])
-                            .map_err(|err| StoreError::Internal(err.to_string()))?;
-                        if updated == 0 {
-                            CompletionDisposition::Ignored
-                        } else {
-                            CompletionDisposition::Completed
-                        }
-                    }
-                    JobOutcome::Failed(message) => {
-                        let attempt = complete_failure
-                            .query_row(
-                                params![message, now, pending.job_id, pending.dispatch_id],
-                                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                            )
-                            .optional()
-                            .map_err(|err| StoreError::Internal(err.to_string()))?;
-                        match attempt {
-                            Some((execution_count, max_retries)) if execution_count <= max_retries => {
-                                CompletionDisposition::Repend
-                            }
-                            Some(_) => CompletionDisposition::Completed,
-                            None => CompletionDisposition::Ignored,
-                        }
-                    }
-                };
-                results.push(result);
+
+            let mut dispositions = vec![CompletionDisposition::Ignored; batch.len()];
+            let mut success_idx = Vec::new();
+            let mut fail_idx = Vec::new();
+            for (i, pending) in batch.iter().enumerate() {
+                match &pending.outcome {
+                    JobOutcome::Succeeded(_) => success_idx.push(i),
+                    JobOutcome::Failed(_) => fail_idx.push(i),
+                }
             }
-            drop(complete_failure);
-            drop(complete_success);
+
+            for chunk in success_idx.chunks(ROWS_PER_STATEMENT) {
+                let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 4);
+                for &i in chunk {
+                    let pending = &batch[i];
+                    let JobOutcome::Succeeded(payload) = &pending.outcome else {
+                        unreachable!("success partition");
+                    };
+                    values.push(&pending.job_id);
+                    values.push(&pending.dispatch_id);
+                    values.push(payload);
+                    values.push(&now);
+                }
+                let sql = bulk::update_from_values_sql(
+                    "job_attempts",
+                    "v",
+                    "status = 'completed', lease_expires_at = NULL, \
+                     result_payload = v.payload, result_error = NULL, updated_at = v.updated_at",
+                    &["job_id", "dispatch_id", "payload", "updated_at"],
+                    chunk.len(),
+                    "job_attempts.job_id = v.job_id AND job_attempts.dispatch_id = v.dispatch_id \
+                     AND job_attempts.status = 'running'",
+                    Some("job_attempts.job_id, job_attempts.dispatch_id"),
+                );
+                let updated = bulk::query_pairs_cached_tx(
+                    &tx,
+                    &sql,
+                    params_from_iter(values),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                let updated: std::collections::HashSet<(i64, String)> = updated.into_iter().collect();
+                for &i in chunk {
+                    let pending = &batch[i];
+                    if updated.contains(&(pending.job_id, pending.dispatch_id.clone())) {
+                        dispositions[i] = CompletionDisposition::Completed;
+                    }
+                }
+            }
+
+            for chunk in fail_idx.chunks(ROWS_PER_STATEMENT) {
+                let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 4);
+                for &i in chunk {
+                    let pending = &batch[i];
+                    let JobOutcome::Failed(message) = &pending.outcome else {
+                        unreachable!("fail partition");
+                    };
+                    values.push(&pending.job_id);
+                    values.push(&pending.dispatch_id);
+                    values.push(message);
+                    values.push(&now);
+                }
+                let sql = bulk::update_from_values_sql(
+                    "job_attempts",
+                    "v",
+                    "status = 'failed', lease_expires_at = NULL, \
+                     result_error = v.message, updated_at = v.updated_at",
+                    &["job_id", "dispatch_id", "message", "updated_at"],
+                    chunk.len(),
+                    "job_attempts.job_id = v.job_id AND job_attempts.dispatch_id = v.dispatch_id \
+                     AND job_attempts.status = 'running'",
+                    Some(
+                        "job_attempts.job_id, job_attempts.dispatch_id, \
+                         job_attempts.execution_count, job_attempts.max_retries_at_claim",
+                    ),
+                );
+                let updated = bulk::query_pairs_cached_tx(
+                    &tx,
+                    &sql,
+                    params_from_iter(values),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )?;
+                let by_key: std::collections::HashMap<(i64, String), (i64, i64)> = updated
+                    .into_iter()
+                    .map(|(job_id, dispatch_id, execution_count, max_retries)| {
+                        ((job_id, dispatch_id), (execution_count, max_retries))
+                    })
+                    .collect();
+                for &i in chunk {
+                    let pending = &batch[i];
+                    dispositions[i] = match by_key.get(&(pending.job_id, pending.dispatch_id.clone()))
+                    {
+                        Some((execution_count, max_retries))
+                            if *execution_count <= *max_retries =>
+                        {
+                            CompletionDisposition::Repend
+                        }
+                        Some(_) => CompletionDisposition::Completed,
+                        None => CompletionDisposition::Ignored,
+                    };
+                }
+            }
+
             tx.commit()
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
-            Ok(results)
+            Ok(dispositions)
         })();
         match result {
             Ok(results) => {

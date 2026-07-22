@@ -1,4 +1,5 @@
 mod adaptive;
+mod bulk;
 mod common;
 mod ingest;
 mod options;
