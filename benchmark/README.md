@@ -1,21 +1,20 @@
 # Benchmark suite
 
-External load tests against a **standing** maqistor process. Scripts do **not** start the server.
+External load tests against a **standing** maqistor process. The runner does
+**not** start the server.
 
-Driver: **[oha](https://github.com/hatoo/oha)** (orchestrated by Python). Same stages, two load shapes:
+Driver: **[oha](https://github.com/hatoo/oha)** (orchestrated by
+`benchmark/run.py`). Helpers live in `benchmark/oha_util.py`.
 
-| Script | oha mode | Question |
-|--------|----------|----------|
-| `run_closed.py` | `-c` concurrent connections | Where does **throughput drop** across stages? |
-| `run_open.py` | `-q` offered QPS | Can we **absorb a target rate**? |
-| `run_capacity.py` | closed + open sweeps | What is the durable-ingest ceiling? |
+| Mode | oha shape | Question |
+|------|-----------|----------|
+| `closed` | `-c` concurrency sweep | Where does durable ingest throughput peak? |
+| `open` | `-q` offered QPS sweep | Can we absorb a target rate? |
+| `both` | closed then open | Combined capacity sweep (default) |
+| `full` | open QPS + post-step drain | Ingest **and** create→complete cycle delay |
 
-Use **closed** to find stagger (health → ingest → full).  
-Use **open** to check whether a chosen offer holds (ach/off).
-All runners wait for requests already in flight at the duration deadline, so
-the last durable batch is counted rather than aborted by the load generator.
-
-Dispatch is internal — not a stage. It only appears inside full E2E later.
+All points wait for in-flight requests at the duration deadline, so the last
+durable batch is counted rather than aborted by the load generator.
 
 ## Prerequisites
 
@@ -23,6 +22,23 @@ Dispatch is internal — not a stage. It only appears inside full E2E later.
 cargo install oha
 # ensure ~/.cargo/bin (or %USERPROFILE%\.cargo\bin) is on PATH
 ```
+
+### Managed no-op worker
+
+The benchmark `bench` queue runs as a managed Docker worker. Generate local,
+short-lived mTLS certificates and build the image from the workspace root
+before starting Maqistor:
+
+```bash
+sh benchmark/generate-certs.sh
+docker build -f benchmark/noop-worker/Dockerfile -t maqistor-benchmark-noop-worker:0.1.0 .
+```
+
+The worker connects to `host.docker.internal:17829` (Docker Desktop) and
+discards each JSON payload before returning an empty successful result. The
+certificate directory is ignored by Git.
+
+`--mode full` requires this worker so jobs drain and complete.
 
 Prefer a **release** server for meaningful numbers:
 
@@ -44,110 +60,75 @@ Windows:
 .\target\release\maqistor.exe --config benchmark\maqistor.toml
 ```
 
-Run the binary from the workspace root so config/`database_path` resolve.  
+Run the binary from the workspace root so config paths resolve.
 Avoid `cargo run -p maqistor-dispatcher -- --config ...` (wrong cwd).
 
-Listens on `http://127.0.0.1:18081`, job name `bench`.  
-DB under `benchmark/data/` (gitignored).  
-Group-commit self-tunes from request rate, SQL commit rate, commit duration, and
-batch fill. `benchmark/maqistor.toml` may set an EWMA window and optional hard
-batch/wait caps, but never selects a fixed batch or timeout.
+Listens on `http://127.0.0.1:18081`, job name `bench`.
+DBs under `benchmark/data/` (gitignored), set in `[persistence]`:
+`maqistor-ingest.db` + `maqistor-results.db`. Delete both after a schema cut
+(current schema is **v1** on each file; older prototype files will refuse to open).
+Enqueue and completion use **separate SQLite writers** so completes do not share
+the ingest commit pipe. Each side still self-tunes batch size/wait from request
+rate, SQL commit rate, commit duration, and batch fill.
+`benchmark/maqistor.toml` sets persistence writer batching under
+`[persistence.enqueue]` / `[persistence.completion]`, and dispatch ceilings
+under `[dispatch]` (`batch_size_max`, `max_in_flight`). Claim size follows
+free worker slots from `reserve`, capped by those ceilings.
 
-## Concurrent (`run_closed.py`)
-
-oha keeps `-c` connections busy (same idea as your manual `oha -c 100 -z 90s` runs).
-
-```bash
-python benchmark/run_closed.py
-python benchmark/run_closed.py --load high --sustain medium
-python benchmark/run_closed.py --stages health,ingest
-```
-
-| Flag | Values | Default | Meaning |
-|------|--------|---------|---------|
-| `--load` | `low` / `medium` / `high` | `low` | `-c` 32 / 100 / 200 |
-| `--sustain` | `low` / `medium` / `high` | `low` | `-z` 30s / 90s / 150s |
-| `--stages` | comma list | all three | `health`, `ingest`, `full` |
-
-Example:
-
-```text
-stage           ops/s   p50_ms   p99_ms   errors  delta_ops
--------------------------------------------------------------
-health        55000.0      1.7      4.0        0          —
-ingest         4200.0     18.0     69.0        0   -50800.0
-full          skipped
-```
-
-- **ops/s** = oha `requestsPerSec` (ingest ⇒ **jobs/s**)
-- Fails fast if status codes are not `204` (health) / `201` (ingest)
-- Writes `benchmark/results/summary-closed-*.json` (+ raw oha JSON under `results/raw/`)
-
-## Offer (`run_open.py`)
-
-oha `-q` rate limit + enough `-c` to sustain the offer.
-
-```bash
-python benchmark/run_open.py
-python benchmark/run_open.py --load medium --sustain low
-```
-
-| Flag | Values | Default | Meaning |
-|------|--------|---------|---------|
-| `--load` | `low` / `medium` / `high` | `low` | `-q` 10k / 50k / 100k (`-c` 100 / 200 / 400) |
-| `--sustain` | `low` / `medium` / `high` | `low` | `-z` 10s / 15s / 30s |
-| `--stages` | comma list | all three | same as closed |
-
-Example:
-
-```text
-stage       offered   achieved   ach/off   p50_ms   p99_ms   errors
---------------------------------------------------------------------
-health        10000   10000.2      100%      1.5      3.0        0
-ingest        10000    9980.1      100%     12.0     40.0        0
-full              —    skipped
-```
-
-ach/off ≈ 100% means the offer was absorbed — not that you found the ceiling.
-
-## Capacity (`run_capacity.py`)
-
-Use this for performance work. It tests only durable `POST /jobs`, first with a
-closed-loop concurrency sweep and then with an open-loop QPS sweep. Raw oha
-reports are retained for every point.
+## Runner (`run.py`)
 
 ```powershell
-# Six closed and six open points, 30 seconds each (about six minutes total).
-python benchmark\run_capacity.py
+# Six closed and six open points, 30s each, 5s settle between points.
+python benchmark\run.py
 
-# Discover the closed-loop ceiling first.
-python benchmark\run_capacity.py --mode closed
+# Closed-loop ceiling only.
+python benchmark\run.py --mode closed
 
-# Test the 8k–14k region with a generous client concurrency.
-python benchmark\run_capacity.py --mode open --open-connections 1000 `
+# Open-loop region with generous client concurrency.
+python benchmark\run.py --mode open --open-connections 1000 `
   --open-qps 8000,9000,10000,11000,12000,14000
+
+# Full cycle: offer QPS, drain the bench queue, report cycle delay from DB.
+python benchmark\run.py --mode full --open-qps 1000,2000 --duration 10 `
+  --settle-seconds 5
 ```
 
-An open-loop point is marked **stable** only when it has zero errors, achieves
-at least 98% of its offered QPS, and stays below the configured p99 guardrail
-(100 ms by default; override with `--max-p99-ms`). The closed-loop peak is an
-observed ceiling for this machine and local oha client, not a universal SQLite
-limit.
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--mode` | `both` | `closed` / `open` / `both` / `full` |
+| `--duration` | `30` | Seconds per point (`-z`) |
+| `--closed-connections` | `50,100,200,400,800,1200` | Closed-loop `-c` values |
+| `--open-qps` | `4000,6000,8000,10000,12000,16000` | Open/full `-q` values |
+| `--open-connections` | `1000` | `-c` for every open/full point |
+| `--max-p99-ms` | `100` | Stability p99 guardrail |
+| `--settle-seconds` | `5` | Pause after each point before the next |
+| `--drain-timeout-seconds` | `120` | Full only: max wait for queue drain |
+| `--drain-poll-seconds` | `0.5` | Full only: drain poll interval |
+| `--db` | `benchmark/data/maqistor-ingest.db` | Full only: ingest SQLite path (results = `maqistor-results.db`) |
 
-For one-off points, both ordinary runners accept exact overrides:
+An open/full point is marked **stable** only when it has zero errors, achieves
+at least 98% of its offered QPS, and stays below the p99 guardrail. Full mode
+also requires a successful drain. The closed-loop peak is an observed ceiling
+for this machine and local oha client, not a universal SQLite limit.
 
-```powershell
-python benchmark\run_closed.py --connections 800 --stages ingest
-python benchmark\run_open.py --qps 10000 --connections 1000 --stages ingest
-```
+Raw oha JSON lands under `benchmark/results/raw/`. Summaries are
+`summary-capacity-*.json` or `summary-capacity-full-*.json`.
 
-## Stages
+### Full-cycle metrics
 
-| Stage | Request | Status |
-|-------|---------|--------|
-| `health` | `GET /health` | live |
-| `ingest` | `POST /jobs` (body `benchmark/oha-job.json`, auto-written) | live |
-| `full` | post-run DB timestamps | skipped until sleep-job workers exist |
+After each full point, the runner:
+
+1. Snapshots ingest `MAX(id)` before oha (job watermark).
+2. Runs the open-loop ingest offer.
+3. Records backlog (ingest `pending` + results `running` above the watermark).
+4. Polls both SQLite files until those drain (or timeout).
+5. Computes create→complete cycle as results `updated_at` − ingest `created_at`
+   (unix **milliseconds**) for completed attempts in the window.
+6. Reports `done/s` = `completed / (offer_duration + drain_seconds)` next to
+   `queued/s` (oha achieved ingest rate).
+
+Cycle percentiles are millisecond-granularity wall-clock delay from durable
+enqueue stamp to durable completion stamp.
 
 ## Manual oha (same methodology)
 
@@ -162,5 +143,5 @@ On Windows, prefer `-D` file body — inline `-d` JSON is often mangled by Power
 
 ## Notes
 
-- `benchmark/artillery/` is leftover reference only; runners no longer call Artillery.
-- Python here only orchestrates oha and prints the stage table.
+- `benchmark/artillery/` is leftover reference only; the runner no longer calls Artillery.
+- Python only orchestrates oha, optional drain polling, and the result table.

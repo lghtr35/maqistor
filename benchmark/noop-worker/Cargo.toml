@@ -1,0 +1,10 @@
+[package]
+name = "maqistor-benchmark-noop-worker"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+maqistor-worker-sdk = { path = "../../crates/worker-sdk" }
+serde_json.workspace = true
+tokio.workspace = true

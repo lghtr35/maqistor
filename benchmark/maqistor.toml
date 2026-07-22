@@ -1,23 +1,45 @@
-# Benchmark test config
+# Benchmark test config — tuned for throughput (balanced durability).
 listen = "127.0.0.1:18081"
-database_path = "./benchmark/data/maqistor.db"
+worker_listen = "0.0.0.0:17829"
+
+[worker_tls]
+ca_cert_path = "./benchmark/certs/ca.pem"
+cert_path = "./benchmark/certs/maqistor-cert.pem"
+key_path = "./benchmark/certs/maqistor-key.pem"
 
 [persistence]
 durability = "balanced"
-ewma_window = 4
+ingest_database = "./benchmark/data/maqistor-ingest.db"
+results_database = "./benchmark/data/maqistor-results.db"
 
-[persistence.limits]
-batch_size_min = 256
-batch_size_max = 4096
+# Aggressive writer batching: grow fast, wait little under load.
+[persistence.enqueue]
+batch_size_min = 512
+batch_size_max = 8192
 batch_wait_min_ms = 1
 batch_wait_max_ms = 2
-
-[persistence.adaptation]
-batch_probe_factor = 1.25
+ewma_window = 4
+batch_probe_factor = 1.50
 batch_backoff_factor = 0.80
 
-[[workers]]
+[persistence.completion]
+batch_size_min = 512
+batch_size_max = 8192
+batch_wait_min_ms = 1
+batch_wait_max_ms = 5
+ewma_window = 4
+batch_probe_factor = 1.50
+batch_backoff_factor = 0.80
+
+# Ask reserve up to the hard claim ceiling; claim = free slots returned.
+[dispatch]
+batch_size_max = 16384
+max_in_flight = 2048
+
+[[queues]]
 name = "bench"
-replicas = 1
-concurrency = 1
-max_retries = 3
+mode = "managed"
+image = "maqistor-benchmark-noop-worker:0.1.0"
+replicas = 16
+max_retries = 0
+timeout_secs = 60

@@ -1,0 +1,43 @@
+# Optional — defaults shown in comments
+# listen = "0.0.0.0:7828"
+# worker_listen = "0.0.0.0:7829"
+
+# Durable stores + write policy.
+# [persistence]
+# ingest_database = "./data/maqistor-ingest.db"
+# results_database = "./data/maqistor-results.db"  # default: swap -ingest → -results
+# durability = "balanced"      # "strict" prioritizes crash durability
+# startup = "recover"          # "preserve" leaves stale leases untouched
+# [persistence.enqueue]
+# batch_size_min = 64
+# batch_size_max = 8192
+# batch_wait_min_ms = 1
+# batch_wait_max_ms = 100
+# ewma_window = 16
+# batch_probe_factor = 1.10   # must be greater than one
+# batch_backoff_factor = 0.80 # must be between zero and one
+# [persistence.completion]
+# batch_size_min = 128
+# batch_size_max = 8192
+# batch_wait_min_ms = 1
+# batch_wait_max_ms = 20
+# ewma_window = 16
+# batch_probe_factor = 1.25
+# batch_backoff_factor = 0.80
+
+# Claim ask ceiling and concurrent dispatch writes.
+# Actual claim size is whatever free worker slots reserve returns.
+# [dispatch]
+# batch_size_max = 8192   # must be <= 16384
+# max_in_flight = 1024
+
+[worker_tls]
+ca_cert_path = "./certs/ca.pem"
+cert_path = "./certs/maqistor-cert.pem"
+key_path = "./certs/maqistor-key.pem"
+
+[[queues]]
+name = "example"
+mode = "external"
+max_retries = 3
+timeout_secs = 60

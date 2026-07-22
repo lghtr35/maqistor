@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 maqistor-engine.workspace = true
 rusqlite.workspace = true
+uuid.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

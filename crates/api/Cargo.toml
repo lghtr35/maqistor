@@ -12,4 +12,5 @@ tower-http.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
+maqistor-dispatcher.workspace = true
 tokio.workspace = true

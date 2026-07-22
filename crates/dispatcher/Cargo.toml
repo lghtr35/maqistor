@@ -5,6 +5,13 @@ edition.workspace = true
 
 [dependencies]
 bollard.workspace = true
+futures-util.workspace = true
+anyhow.workspace = true
 maqistor-engine.workspace = true
+maqistor-worker-protocol = { path = "../worker-protocol" }
+rustls.workspace = true
+rustls-pemfile.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
+uuid.workspace = true

@@ -15,6 +15,7 @@ maqistor-api.workspace = true
 maqistor-dispatcher.workspace = true
 maqistor-engine.workspace = true
 maqistor-persistence.workspace = true
+maqistor-worker-protocol = { path = "../worker-protocol" }
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true

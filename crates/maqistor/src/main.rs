@@ -1,13 +1,15 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use maqistor_dispatcher::DockerDispatcher;
-use maqistor_engine::{DurableStore, Engine, JobQueue};
+use maqistor_dispatcher::{
+    DockerWorkerSupervisor, ManagedQueue, RegistryDispatcher, TlsFiles, start_worker_listener,
+};
+use maqistor_engine::{DurableStore, Engine, JobQueue, unix_now};
 use maqistor_persistence::SqliteStore;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use config::StartupPolicy;
+use config::{QueueMode, StartupPolicy};
 
 mod config;
 
@@ -29,22 +31,19 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config;
     let config = config::AppConfig::load(&config_path)?;
-    let store = SqliteStore::open_with_options(
-        config.database_path(),
+    let store = SqliteStore::open_with_options_pair(
+        config.persistence.ingest_database_path(),
+        config.persistence.results_database_path(),
         config.persistence.write_options()?,
     )?;
-    for worker in &config.workers {
-        let mut queue = JobQueue::new(worker.name.clone());
-        queue.concurrency = worker.concurrency;
-        queue.max_retries = worker.max_retries;
+    for queue_config in &config.queues {
+        let mut queue = JobQueue::new(queue_config.name.clone());
+        queue.max_retries = queue_config.max_retries;
+        queue.timeout_secs = queue_config.timeout_secs;
         store.upsert_queue(queue).await?;
     }
     if config.persistence.startup == StartupPolicy::Recover {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|err| anyhow::anyhow!("system clock before unix epoch: {err}"))?
-            .as_secs() as i64;
-        let recovered = store.recover_stale_leases(now).await?;
+        let recovered = store.recover_stale_leases(unix_now()).await?;
         if !recovered.is_empty() {
             info!(
                 recovered = recovered.len(),
@@ -52,7 +51,42 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let engine = Engine::with_dispatcher(store, DockerDispatcher::new());
+    let worker_addr: SocketAddr = config.worker_listen().parse().map_err(|err| {
+        anyhow::anyhow!(
+            "invalid worker_listen address {}: {err}",
+            config.worker_listen()
+        )
+    })?;
+    let worker_registry = start_worker_listener(
+        worker_addr,
+        TlsFiles {
+            ca_cert_path: config.worker_tls.ca_cert_path.clone(),
+            cert_path: config.worker_tls.cert_path.clone(),
+            key_path: config.worker_tls.key_path.clone(),
+        },
+        config.queues.iter().map(|q| q.name.clone()).collect(),
+    )
+    .await?;
+    DockerWorkerSupervisor::connect(
+        config
+            .queues
+            .iter()
+            .filter(|q| q.mode == QueueMode::Managed)
+            .map(|q| ManagedQueue {
+                name: q.name.clone(),
+                image: q.image.clone().expect("validated managed image"),
+                replicas: q.replicas(),
+            })
+            .collect(),
+    )
+    .map_err(|err| anyhow::anyhow!("initialize managed worker supervisor: {err}"))?
+    .spawn();
+    let engine = Engine::with_dispatcher(
+        store,
+        RegistryDispatcher::new(worker_registry.clone()),
+        config.dispatch.options()?,
+    );
+    engine.start_result_listener();
     let addr: SocketAddr = config
         .listen()
         .parse()
@@ -61,8 +95,11 @@ async fn main() -> anyhow::Result<()> {
     info!(
         listen = %addr,
         config = %config_path,
-        db = %config.database_path(),
-        workers = config.workers.len(),
+        db_ingest = %config.persistence.ingest_database_path(),
+        db_results = %config.persistence.results_database_path(),
+        queues = config.queues.len(),
+        worker_listen = %worker_addr,
+        worker_registry = ?worker_registry.snapshot().await.len(),
         durability = ?config.persistence.durability,
         startup = ?config.persistence.startup,
         "maqistor listening"
