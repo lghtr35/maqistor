@@ -18,6 +18,7 @@ const DEFAULT_BATCH_BACKOFF_FACTOR: f64 = 0.80;
 #[serde(rename_all = "lowercase")]
 pub enum DurabilityMode {
     #[default]
+    None,
     Balanced,
     Strict,
 }

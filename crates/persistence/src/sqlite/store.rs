@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use maqistor_engine::{DurableStore, Job, JobOutcome, JobQueue, JobStatus, StoreError};
+use maqistor_engine::{AcceptedJob, DurableStore, Job, JobOutcome, JobQueue, ExecutionStatus, StoreError};
 
 use super::options::DurabilityMode;
 use super::common::{
@@ -8,7 +8,7 @@ use super::common::{
 };
 use super::ingest::{IngestClaimed, IngestHandle};
 use super::options::SqliteWriteOptions;
-use super::results::{CompletionDisposition, ResultsHandle, RunningInsert};
+use super::results::{CompletionDisposition, DispatchInsert, DispatchedExecution, ResultsHandle};
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -41,7 +41,7 @@ impl SqliteStore {
         let ingest = IngestHandle::open(ingest_path.clone(), &options)?;
         let results = ResultsHandle::open(results_path, &options)?;
         Self::heal_on_open(&ingest_path, &ingest, &results)?;
-        Ok(Self { ingest, results })
+        Ok(Self { ingest, results})
     }
 
     fn heal_on_open(
@@ -58,27 +58,27 @@ impl SqliteStore {
     }
 
     async fn composed_job(&self, job_id: i64) -> Result<Job, StoreError> {
-        let ingest = self.ingest.ingest_row(job_id).await?;
-        let attempt = self.results.latest_attempt(job_id).await?;
-        merge_job(ingest, attempt)
+        let accepted = self.ingest.accepted_row(job_id).await?;
+        let execution = self.results.execution(job_id).await?;
+        Ok(merge_job(accepted, execution))
     }
 
     fn job_from_claimed(
         claimed: &IngestClaimed,
-        lease_expires_at: i64,
+        dispatched: &DispatchedExecution,
     ) -> Job {
         Job {
             id: claimed.id,
             name: claimed.name.clone(),
-            status: JobStatus::Running,
+            status: ExecutionStatus::Running,
             payload: claimed.payload.clone(),
-            execution_count: claimed.execution_count,
-            lease_expires_at: Some(lease_expires_at),
-            dispatch_id: Some(claimed.dispatch_id.clone()),
+            execution_count: dispatched.execution_count,
+            lease_expires_at: Some(dispatched.lease_expires_at),
+            dispatch_id: Some(dispatched.dispatch_id.clone()),
             result_payload: None,
             result_error: None,
             created_at: claimed.created_at,
-            updated_at: claimed.updated_at,
+            updated_at: dispatched.updated_at,
         }
     }
 
@@ -92,37 +92,46 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
         let claimed_at = unix_now();
-        let mut running_rows = Vec::with_capacity(claimed.len());
-        let mut jobs = Vec::with_capacity(claimed.len());
+        let mut dispatch_rows = Vec::with_capacity(claimed.len());
         for row in &claimed {
             let lease_expires_at = claimed_at
                 .saturating_add((row.timeout_secs as i64).saturating_mul(1000));
-            running_rows.push(RunningInsert {
+            dispatch_rows.push(DispatchInsert {
                 job_id: row.id,
                 queue_name: row.name.clone(),
                 dispatch_id: row.dispatch_id.clone(),
-                execution_count: row.execution_count,
-                max_retries_at_claim: row.max_retries,
                 lease_expires_at,
             });
-            jobs.push(Self::job_from_claimed(row, lease_expires_at));
         }
-        if let Err(err) = self.results.insert_running(running_rows).await {
-            for row in &claimed {
-                let _ = self
-                    .ingest
-                    .repend(row.id, &row.dispatch_id)
-                    .await;
+        let dispatched = match self.results.dispatch(dispatch_rows).await {
+            Ok(dispatched) => dispatched,
+            Err(err) => {
+                for row in &claimed {
+                    let _ = self.ingest.repend(row.id, &row.dispatch_id).await;
+                }
+                return Err(err);
             }
-            return Err(err);
+        };
+        let mut jobs = Vec::with_capacity(claimed.len());
+        for (claimed, dispatched) in claimed.iter().zip(dispatched.iter()) {
+            jobs.push(Self::job_from_claimed(claimed, dispatched));
         }
         Ok(jobs)
+    }
+
+    pub async fn cleanup_expired_records(&self, cutoff: i64) -> Result<usize, StoreError> {
+        let mut deleted = 0;
+        deleted += self.ingest.cleanup_expired_records(cutoff).await?;
+        deleted += self.results.cleanup_expired_records(cutoff).await?;
+        Ok(deleted)
     }
 }
 
 impl DurableStore for SqliteStore {
     async fn upsert_queue(&self, queue: JobQueue) -> Result<JobQueue, StoreError> {
-        self.ingest.upsert_queue(queue).await
+        let queue = self.ingest.upsert_queue(queue).await?;
+        self.results.upsert_queue(queue.clone()).await?;
+        Ok(queue)
     }
 
     async fn get_queue(&self, name: &str) -> Result<Option<JobQueue>, StoreError> {
@@ -133,7 +142,7 @@ impl DurableStore for SqliteStore {
         self.ingest.reads.queues().await
     }
 
-    async fn enqueue(&self, job: Job) -> Result<Job, StoreError> {
+    async fn enqueue(&self, job: AcceptedJob) -> Result<AcceptedJob, StoreError> {
         self.ingest.enqueue(job).await
     }
 
@@ -141,7 +150,7 @@ impl DurableStore for SqliteStore {
         self.composed_job(job_id).await
     }
 
-    async fn status(&self, job_id: i64) -> Result<JobStatus, StoreError> {
+    async fn status(&self, job_id: i64) -> Result<ExecutionStatus, StoreError> {
         Ok(self.composed_job(job_id).await?.status)
     }
 
@@ -190,8 +199,8 @@ impl DurableStore for SqliteStore {
 
 
     async fn release_claim(&self, job_id: i64, dispatch_id: &str) -> Result<bool, StoreError> {
-        let ingest = self.ingest.ingest_row(job_id).await?;
-        if ingest.status != "claimed" || ingest.dispatch_id.as_deref() != Some(dispatch_id) {
+        let accepted = self.ingest.accepted_row(job_id).await?;
+        if accepted.dispatch_id.as_deref() != Some(dispatch_id) {
             return Ok(false);
         }
         self.results.abandon(job_id, dispatch_id).await?;
@@ -206,9 +215,9 @@ impl DurableStore for SqliteStore {
             if item.should_repend {
                 self.ingest.repend(item.job_id, &item.dispatch_id).await?;
             }
-            let ingest = self.ingest.ingest_row(item.job_id).await?;
-            let attempt = self.results.latest_attempt(item.job_id).await?;
-            jobs.push(merge_job(ingest, attempt)?);
+            let accepted = self.ingest.accepted_row(item.job_id).await?;
+            let execution = self.results.execution(item.job_id).await?;
+            jobs.push(merge_job(accepted, execution));
         }
         Ok(jobs)
     }

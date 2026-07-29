@@ -10,13 +10,12 @@ use rusqlite::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
-use maqistor_engine::{Job, JobQueue, JobStatus, MAX_CLAIM_BATCH_SIZE, StoreError};
+use maqistor_engine::{AcceptedJob, JobQueue, MAX_CLAIM_BATCH_SIZE, StoreError};
 
 use super::adaptive::{AdaptiveBatchController, FlushReason};
 use super::bulk::{self, ROWS_PER_STATEMENT};
 use super::common::{
-    IngestJobRow, ReadPool, RwConnection, apply_ingest_schema, new_dispatch_id,
-    row_to_queue, unix_now,
+    ReadPool, RwConnection, apply_acceptance_schema, new_dispatch_id, row_to_queue, unix_now,
 };
 use super::options::{DurabilityMode, SqliteWriteOptions};
 
@@ -24,9 +23,7 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 const JOBS_INSERT_COLUMNS: &[&str] = &[
     "queue_name",
-    "status",
     "payload",
-    "execution_count",
     "created_at",
     "updated_at",
 ];
@@ -36,12 +33,9 @@ pub(crate) struct IngestClaimed {
     pub id: i64,
     pub name: String,
     pub payload: Vec<u8>,
-    pub execution_count: u32,
-    pub max_retries: u32,
     pub timeout_secs: u64,
     pub dispatch_id: String,
     pub created_at: i64,
-    pub updated_at: i64,
 }
 
 enum IngestRequest {
@@ -50,8 +44,8 @@ enum IngestRequest {
         reply: oneshot::Sender<Result<JobQueue, StoreError>>,
     },
     Enqueue {
-        job: Job,
-        reply: oneshot::Sender<Result<Job, StoreError>>,
+        job: AcceptedJob,
+        reply: oneshot::Sender<Result<AcceptedJob, StoreError>>,
     },
     ClaimBatch {
         queue_name: String,
@@ -63,11 +57,15 @@ enum IngestRequest {
         dispatch_id: String,
         reply: oneshot::Sender<Result<(), StoreError>>,
     },
+    CleanupExpiredRecords {
+        cutoff: i64,
+        reply: oneshot::Sender<Result<usize, StoreError>>,
+    },
 }
 
 struct PendingEnqueue {
-    job: Job,
-    reply: oneshot::Sender<Result<Job, StoreError>>,
+    job: AcceptedJob,
+    reply: oneshot::Sender<Result<AcceptedJob, StoreError>>,
 }
 
 struct BatchCommit {
@@ -82,7 +80,7 @@ struct IngestConn {
 impl IngestConn {
     fn open(path: &Path, durability: DurabilityMode) -> Result<Self, StoreError> {
         let rw = RwConnection::open(path, durability)?;
-        rw.migrate_schema(apply_ingest_schema)?;
+        rw.migrate_schema(apply_acceptance_schema)?;
         Ok(Self { conn: rw.conn })
     }
 
@@ -139,12 +137,12 @@ impl IngestConn {
 
         let mut to_insert = Vec::with_capacity(batch.len());
         for pending in batch {
-            if queue_names.contains(&pending.job.name) {
+            if queue_names.contains(&pending.job.queue_name) {
                 to_insert.push(pending);
             } else {
                 let _ = pending
                     .reply
-                    .send(Err(StoreError::QueueNotFound(pending.job.name)));
+                    .send(Err(StoreError::QueueNotFound(pending.job.queue_name)));
             }
         }
 
@@ -160,27 +158,22 @@ impl IngestConn {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
 
-            let execution_count = 0_i64;
             for chunk in to_insert.chunks_mut(ROWS_PER_STATEMENT) {
-                let status = "pending";
-                let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 6);
+                let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 4);
                 for pending in chunk.iter() {
-                    values.push(&pending.job.name);
-                    values.push(&status);
+                    values.push(&pending.job.queue_name);
                     values.push(&pending.job.payload);
-                    values.push(&execution_count);
                     values.push(&pending.job.created_at);
                     values.push(&pending.job.updated_at);
                 }
                 bulk::execute_cached_tx(
                     &tx,
-                    &bulk::insert_sql("jobs", JOBS_INSERT_COLUMNS, chunk.len()),
+                    &bulk::insert_sql("accepted_jobs", JOBS_INSERT_COLUMNS, chunk.len()),
                     params_from_iter(values),
                 )?;
                 let first_id = tx.last_insert_rowid() - chunk.len() as i64 + 1;
                 for (offset, pending) in chunk.iter_mut().enumerate() {
                     pending.job.id = first_id + offset as i64;
-                    pending.job.status = JobStatus::Pending;
                 }
             }
 
@@ -227,17 +220,16 @@ impl IngestConn {
             name: String,
             payload: Vec<u8>,
             created_at: i64,
-            max_retries: i64,
             timeout_secs: i64,
         }
         let pending: Vec<PendingClaim> = {
             let mut statement = tx
                 .prepare(
-                    "SELECT jobs.id, jobs.queue_name, jobs.payload,
-                            jobs.created_at, job_queues.max_retries, job_queues.timeout_secs
-                     FROM jobs JOIN job_queues ON job_queues.name = jobs.queue_name
-                     WHERE jobs.queue_name = ?1 AND jobs.status = 'pending'
-                     ORDER BY jobs.created_at ASC, jobs.id ASC LIMIT ?2",
+                    "SELECT accepted_jobs.id, accepted_jobs.queue_name, accepted_jobs.payload,
+                            accepted_jobs.created_at, job_queues.timeout_secs
+                     FROM accepted_jobs JOIN job_queues ON job_queues.name = accepted_jobs.queue_name
+                     WHERE accepted_jobs.queue_name = ?1 AND accepted_jobs.dispatch_id IS NULL
+                     ORDER BY accepted_jobs.created_at ASC, accepted_jobs.id ASC LIMIT ?2",
                 )
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             statement
@@ -247,8 +239,7 @@ impl IngestConn {
                         name: row.get(1)?,
                         payload: row.get(2)?,
                         created_at: row.get(3)?,
-                        max_retries: row.get(4)?,
-                        timeout_secs: row.get(5)?,
+                        timeout_secs: row.get(4)?,
                     })
                 })
                 .map_err(|err| StoreError::Internal(err.to_string()))?
@@ -267,49 +258,32 @@ impl IngestConn {
                 values.push(&now);
             }
             let sql = bulk::update_from_values_sql(
-                "jobs",
+                "accepted_jobs",
                 "v",
-                "status = 'claimed', dispatch_id = v.dispatch_id, \
-                 execution_count = execution_count + 1, updated_at = v.updated_at",
+                "dispatch_id = v.dispatch_id, updated_at = v.updated_at",
                 &["id", "dispatch_id", "updated_at"],
                 chunk.len(),
-                "jobs.id = v.id AND jobs.status = 'pending'",
-                Some("jobs.id, jobs.dispatch_id, jobs.execution_count, jobs.updated_at"),
+                "accepted_jobs.id = v.id AND accepted_jobs.dispatch_id IS NULL",
+                Some("accepted_jobs.id, accepted_jobs.dispatch_id"),
             );
             let updated = bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?;
-            let by_id: std::collections::HashMap<i64, (String, i64, i64)> = updated
-                .into_iter()
-                .map(|(id, dispatch_id, execution_count, updated_at)| {
-                    (id, (dispatch_id, execution_count, updated_at))
-                })
-                .collect();
+            let by_id: std::collections::HashMap<i64, String> =
+                updated.into_iter().collect();
             for row in chunk {
-                let Some((dispatch_id, execution_count, updated_at)) = by_id.get(&row.id) else {
+                let Some(dispatch_id) = by_id.get(&row.id) else {
                     continue;
                 };
-                let execution_count = u32::try_from(*execution_count)
-                    .map_err(|err| StoreError::Internal(err.to_string()))?;
-                let max_retries = u32::try_from(row.max_retries)
-                    .map_err(|err| StoreError::Internal(err.to_string()))?;
                 let timeout_secs = u64::try_from(row.timeout_secs)
                     .map_err(|err| StoreError::Internal(err.to_string()))?;
                 claimed.push(IngestClaimed {
                     id: row.id,
                     name: row.name.clone(),
                     payload: row.payload.clone(),
-                    execution_count,
-                    max_retries,
                     timeout_secs,
                     dispatch_id: dispatch_id.clone(),
                     created_at: row.created_at,
-                    updated_at: *updated_at,
                 });
             }
         }
@@ -335,17 +309,27 @@ impl IngestConn {
                 values.push(&now);
             }
             let sql = bulk::update_from_values_sql(
-                "jobs",
+                "accepted_jobs",
                 "v",
-                "status = 'pending', dispatch_id = NULL, updated_at = v.updated_at",
+                "dispatch_id = NULL, updated_at = v.updated_at",
                 &["id", "dispatch_id", "updated_at"],
                 chunk.len(),
-                "jobs.id = v.id AND jobs.status = 'claimed' AND jobs.dispatch_id = v.dispatch_id",
+                "accepted_jobs.id = v.id AND accepted_jobs.dispatch_id = v.dispatch_id",
                 None,
             );
             bulk::execute_cached(&self.conn, &sql, params_from_iter(values))?;
         }
         Ok(())
+    }
+
+    fn cleanup_expired_records(&mut self, cutoff: i64) -> Result<usize, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("DELETE FROM accepted_jobs WHERE created_at < ?1")
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        let rows_affected = statement.execute(params![cutoff])
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        Ok(rows_affected)
     }
 
     fn handle(&mut self, request: IngestRequest, queue_names: &mut HashSet<String>) {
@@ -374,6 +358,9 @@ impl IngestConn {
                 reply,
             } => {
                 let _ = reply.send(self.repend(job_id, &dispatch_id));
+            }
+            IngestRequest::CleanupExpiredRecords { cutoff, reply } => {
+                let _ = reply.send(self.cleanup_expired_records(cutoff));
             }
         }
     }
@@ -451,7 +438,7 @@ impl IngestHandle {
             .await
     }
 
-    pub(crate) async fn enqueue(&self, job: Job) -> Result<Job, StoreError> {
+    pub(crate) async fn enqueue(&self, job: AcceptedJob) -> Result<AcceptedJob, StoreError> {
         self.call(|reply| IngestRequest::Enqueue { job, reply }).await
     }
 
@@ -480,8 +467,13 @@ impl IngestHandle {
     }
 
 
-    pub(crate) async fn ingest_row(&self, job_id: i64) -> Result<IngestJobRow, StoreError> {
-        self.reads.ingest_job(job_id).await
+    pub(crate) async fn accepted_row(&self, job_id: i64) -> Result<AcceptedJob, StoreError> {
+        self.reads.accepted_job(job_id).await
+    }
+
+    pub(crate) async fn cleanup_expired_records(&self, cutoff: i64) -> Result<usize, StoreError> {
+        self.call(|reply| IngestRequest::CleanupExpiredRecords { cutoff, reply })
+            .await
     }
 }
 
@@ -502,7 +494,7 @@ impl IngestQueues {
                 self.ingest.push_back(PendingEnqueue { job, reply });
             }
             IngestRequest::ClaimBatch { .. } => self.claim.push_back(request),
-            IngestRequest::UpsertQueue { .. } | IngestRequest::Repend { .. } => {
+            IngestRequest::UpsertQueue { .. } | IngestRequest::Repend { .. } | IngestRequest::CleanupExpiredRecords { .. } => {
                 self.meta.push_back(request);
             }
         }

@@ -2,7 +2,7 @@ use rusqlite::{Connection, Params, Transaction};
 
 use maqistor_engine::StoreError;
 
-pub(crate) const ROWS_PER_STATEMENT: usize = 64;
+pub(crate) const ROWS_PER_STATEMENT: usize = 256;
 
 pub(crate) fn values_placeholders(rows: usize, cols: usize) -> String {
     debug_assert!(rows > 0 && cols > 0);
@@ -24,6 +24,33 @@ pub(crate) fn insert_sql(table: &str, columns: &[&str], rows: usize) -> String {
     let cols = columns.join(", ");
     let values = values_placeholders(rows, columns.len());
     format!("INSERT INTO {table} ({cols}) VALUES {values}")
+}
+
+pub(crate) fn upsert_sql(
+    table: &str,
+    columns: &[&str],
+    rows: usize,
+    conflict_target: &str,
+    update_set_sql: &str,
+    update_where_sql: Option<&str>,
+    returning: Option<&str>,
+) -> String {
+    debug_assert!(!columns.is_empty());
+    let cols = columns.join(", ");
+    let values = values_placeholders(rows, columns.len());
+    let mut sql = format!(
+        "INSERT INTO {table} ({cols}) VALUES {values} \
+         ON CONFLICT({conflict_target}) DO UPDATE SET {update_set_sql}"
+    );
+    if let Some(where_sql) = update_where_sql {
+        sql.push_str(" WHERE ");
+        sql.push_str(where_sql);
+    }
+    if let Some(returning) = returning {
+        sql.push_str(" RETURNING ");
+        sql.push_str(returning);
+    }
+    sql
 }
 
 pub(crate) fn update_from_values_sql(

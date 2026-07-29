@@ -57,7 +57,9 @@ def open_db(path: Path) -> sqlite3.Connection:
 
 
 def max_job_id(ingest: sqlite3.Connection) -> int:
-    row = ingest.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM jobs").fetchone()
+    row = ingest.execute(
+        "SELECT COALESCE(MAX(id), 0) AS max_id FROM accepted_jobs"
+    ).fetchone()
     return int(row["max_id"])
 
 
@@ -67,17 +69,17 @@ def count_open(
     queue: str,
     after_id: int,
 ) -> int:
-    """Pending ingest rows + running results attempts above the job watermark."""
+    """Available ingest rows + running executions above the job watermark."""
     pending = ingest.execute(
         """
-        SELECT COUNT(*) AS n FROM jobs
-        WHERE queue_name = ?1 AND id > ?2 AND status = 'pending'
+        SELECT COUNT(*) AS n FROM accepted_jobs
+        WHERE queue_name = ?1 AND id > ?2 AND dispatch_id IS NULL
         """,
         (queue, after_id),
     ).fetchone()
     running = results.execute(
         """
-        SELECT COUNT(*) AS n FROM job_attempts
+        SELECT COUNT(*) AS n FROM executions
         WHERE queue_name = ?1 AND job_id > ?2 AND status = 'running'
         """,
         (queue, after_id),
@@ -94,7 +96,7 @@ def wait_drain(
     timeout_s: float,
     poll_s: float,
 ) -> tuple[bool, float, int]:
-    """Poll until no pending ingest / running results remain above after_id."""
+    """Poll until no available ingest / running executions remain above after_id."""
     started = time.monotonic()
     remaining = count_open(ingest, results, queue, after_id)
     if remaining == 0:
@@ -129,19 +131,19 @@ def cycle_stats(
     queue: str,
     after_id: int,
 ) -> dict:
-    """Create→complete cycle ms: results.updated_at - ingest.created_at."""
+    """Create→complete cycle ms: execution.updated_at - accepted_jobs.created_at."""
     jobs_in_window = ingest.execute(
         """
-        SELECT COUNT(*) AS n FROM jobs
+        SELECT COUNT(*) AS n FROM accepted_jobs
         WHERE queue_name = ?1 AND id > ?2
         """,
         (queue, after_id),
     ).fetchone()
     jobs_in_window = int(jobs_in_window["n"])
 
-    attempts = results.execute(
+    executions = results.execute(
         """
-        SELECT job_id, status, updated_at FROM job_attempts
+        SELECT job_id, status, updated_at FROM executions
         WHERE queue_name = ?1 AND job_id > ?2
           AND status IN ('completed', 'failed')
         """,
@@ -152,7 +154,7 @@ def cycle_stats(
         int(row["id"]): int(row["created_at"])
         for row in ingest.execute(
             """
-            SELECT id, created_at FROM jobs
+            SELECT id, created_at FROM accepted_jobs
             WHERE queue_name = ?1 AND id > ?2
             """,
             (queue, after_id),
@@ -162,7 +164,7 @@ def cycle_stats(
     completed = 0
     failed = 0
     cycles: list[float] = []
-    for row in attempts:
+    for row in executions:
         job_id = int(row["job_id"])
         status = row["status"]
         if status == "completed":

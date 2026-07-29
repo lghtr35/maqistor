@@ -178,6 +178,7 @@ pub struct ManagedQueue {
     pub name: String,
     pub image: String,
     pub replicas: u32,
+    pub env: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -215,8 +216,24 @@ impl DockerWorkerSupervisor {
     async fn ensure(&self, queue: &ManagedQueue, ordinal: u32) -> Result<()> {
         let name = container_name(&queue.name, ordinal);
         let desired_image = self.resolve_image_id(&queue.image).await?;
+        let desired_env = &queue.env;
         if let Ok(container) = self.docker.inspect_container(&name, None).await {
+            let mut need_update = false;
             if container.image.as_deref() != Some(desired_image.as_str()) {
+                need_update = true;
+            }
+            let current_env = container
+                .config
+                .as_ref()
+                .and_then(|config| config.env.as_deref())
+                .unwrap_or(&[]);
+            if !desired_env
+                .iter()
+                .all(|wanted| current_env.iter().any(|have| have == wanted))
+            {
+                need_update = true;
+            }
+            if need_update {
                 let managed = container
                     .config
                     .as_ref()
@@ -252,6 +269,7 @@ impl DockerWorkerSupervisor {
         ]);
         let config = Config::<String> {
             image: Some(queue.image.clone()),
+            env: Some(queue.env.clone()),
             labels: Some(labels),
             host_config: Some(HostConfig {
                 restart_policy: Some(RestartPolicy {
@@ -314,6 +332,7 @@ impl DockerWorkerSupervisor {
         Ok(id)
     }
 }
+
 fn container_name(queue: &str, ordinal: u32) -> String {
     format!(
         "maqistor-{}-{ordinal}",

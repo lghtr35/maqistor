@@ -1,8 +1,9 @@
-use std::{fs, path::Path, time::Duration};
+use std::{collections::HashMap, fs, path::Path, time::Duration};
 
 use maqistor_engine::DispatchOptions;
 use maqistor_persistence::{BatchOptions, DurabilityMode, SqliteWriteOptions, default_results_path};
 use serde::Deserialize;
+use humantime::parse_duration;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:7828";
 const DEFAULT_WORKER_LISTEN: &str = "0.0.0.0:7829";
@@ -31,11 +32,32 @@ pub struct PersistenceConfig {
     #[serde(default)]
     pub durability: DurabilityMode,
     #[serde(default)]
+    pub cleanup: Option<CleanupConfig>,
+    #[serde(default)]
     pub startup: StartupPolicy,
     #[serde(default)]
     pub enqueue: BatchConfig,
     #[serde(default)]
     pub completion: BatchConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupConfig {
+    interval: String,
+    retention: String,
+}
+
+impl CleanupConfig {
+    pub fn interval(&self) -> anyhow::Result<Duration> {
+        parse_duration(&self.interval)
+            .map_err(|err| anyhow::anyhow!("invalid cleanup.interval {:?}: {err}", self.interval))
+    }
+
+    pub fn retention(&self) -> anyhow::Result<Duration> {
+        parse_duration(&self.retention)
+            .map_err(|err| anyhow::anyhow!("invalid cleanup.retention {:?}: {err}", self.retention))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -137,27 +159,46 @@ pub struct WorkerTlsConfig {
     pub key_path: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum QueueMode {
-    Managed,
-    External,
-}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueConfig {
     pub name: String,
-    pub mode: QueueMode,
-    pub image: Option<String>,
-    pub replicas: Option<u32>,
     pub max_retries: u32,
     pub timeout_secs: u64,
+    pub managed_config: Option<ManagedConfig>,
 }
 
 impl QueueConfig {
     pub fn replicas(&self) -> u32 {
-        self.replicas.unwrap_or(1)
+        self.managed_config.as_ref().map(|c| c.replicas).unwrap_or(1)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConfig {
+    pub image: String,
+    pub replicas: u32,
+    pub env_file: Option<String>,
+    pub env_vars: Option<HashMap<String, String>>,
+}
+
+impl ManagedConfig {
+    pub fn env(&self) -> anyhow::Result<Vec<String>> {
+        let mut res: Vec<String> = self.env_vars.as_ref().map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect()).unwrap_or_default();
+        if let Some(env_file) = &self.env_file {
+            let contents = fs::read_to_string(env_file).map_err(|err| anyhow::anyhow!("failed to read env file {env_file:?}: {err}"));
+            match contents {
+                Ok(contents) => {
+                    res.extend(contents.lines().map(|line| line.trim().to_string()));
+                }
+                Err(err) => {
+                    anyhow::bail!("failed to read env file {env_file:?}: {err}");
+                }
+            }
+        }
+        Ok(res)
     }
 }
 
@@ -175,6 +216,9 @@ impl AppConfig {
     fn validate(&self) -> anyhow::Result<()> {
         self.persistence.write_options()?;
         self.dispatch.options()?;
+        if let Some(cleanup) = &self.persistence.cleanup {
+            validate_cleanup_config(cleanup)?;
+        }
         if self.listen() == self.worker_listen() {
             anyhow::bail!("listen and worker_listen must differ");
         }
@@ -186,26 +230,16 @@ impl AppConfig {
             if queue.timeout_secs == 0 {
                 anyhow::bail!("queue {} must have a positive timeout", queue.name);
             }
-            match queue.mode {
-                QueueMode::Managed
-                    if queue.image.as_deref().is_none_or(str::is_empty)
-                        || queue.replicas() == 0 =>
-                {
+            if let Some(config) = &queue.managed_config {
+                if config.image.is_empty() || config.replicas == 0 {
                     anyhow::bail!(
                         "managed queue {} requires an image and positive replicas",
                         queue.name
                     )
                 }
-                QueueMode::Managed => {
-                    validate_managed_image(queue.image.as_deref().expect("validated image"))?
-                }
-                QueueMode::External if queue.image.is_some() || queue.replicas.is_some() => {
-                    anyhow::bail!(
-                        "external queue {} cannot declare image or replicas",
-                        queue.name
-                    )
-                }
-                _ => {}
+                validate_managed_image(&config.image)?;
+                validate_managed_env_file(&config.env_file)?;
+                validate_managed_env_vars(&config.env_vars)?;
             }
         }
         Ok(())
@@ -220,6 +254,27 @@ impl AppConfig {
             .as_deref()
             .unwrap_or(DEFAULT_WORKER_LISTEN)
     }
+}
+
+fn validate_cleanup_config(cleanup: &CleanupConfig) -> anyhow::Result<()> {
+    if cleanup.interval.trim().is_empty() {
+        anyhow::bail!("cleanup.interval must be set");
+    }
+    if cleanup.retention.trim().is_empty() {
+        anyhow::bail!("cleanup.retention must be set");
+    }
+    let interval = cleanup.interval()?;
+    let retention = cleanup.retention()?;
+    if interval.is_zero() {
+        anyhow::bail!("cleanup.interval must be greater than zero");
+    }
+    if retention.is_zero() {
+        anyhow::bail!("cleanup.retention must be greater than zero");
+    }
+    if retention.as_millis() > i64::MAX as u128 {
+        anyhow::bail!("cleanup.retention is too large");
+    }
+    Ok(())
 }
 
 fn validate_managed_image(image: &str) -> anyhow::Result<()> {
@@ -239,6 +294,27 @@ fn validate_managed_image(image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_managed_env_file(env_file: &Option<String>) -> anyhow::Result<()> {
+    if let Some(env_file) = env_file {
+        let path = Path::new(env_file);
+        if !path.is_file() {
+            anyhow::bail!("managed env file {path:?} does not exist");
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_env_vars(env_vars: &Option<HashMap<String, String>>) -> anyhow::Result<()> {
+    if let Some(vars) = env_vars {
+        for (key, value) in vars {
+            if key.is_empty() || value.is_empty() {
+                anyhow::bail!("managed env vars must be nonempty");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,10 +322,13 @@ mod tests {
 
     #[test]
     fn defaults_hide_adaptive_details() {
-        let config: AppConfig = toml::from_str(&format!("{TLS}[[queues]]\nname = 'email'\nmode = 'external'\nmax_retries = 3\ntimeout_secs = 60\n")).expect("parse");
+        let config: AppConfig = toml::from_str(&format!(
+            "{TLS}[[queues]]\nname = 'email'\nmax_retries = 3\ntimeout_secs = 60\n"
+        ))
+        .expect("parse");
         let options = config.persistence.write_options().expect("options");
         assert_eq!(options.enqueue.ewma_window, 16);
-        assert_eq!(options.durability, DurabilityMode::Balanced);
+        assert_eq!(options.durability, DurabilityMode::None);
         assert_eq!(options.completion.batch_wait_max, Duration::from_millis(20));
     }
 
@@ -295,6 +374,27 @@ mod tests {
         .expect("parse");
         assert_eq!(config.persistence.durability, DurabilityMode::Strict);
         assert_eq!(config.persistence.startup, StartupPolicy::Preserve);
+    }
+
+    #[test]
+    fn validates_cleanup_interval_and_retention() {
+        let ok: AppConfig = toml::from_str(&format!(
+            "{TLS}[persistence.cleanup]\ninterval = '1h'\nretention = '7d'\n"
+        ))
+        .expect("parse");
+        assert!(ok.validate().is_ok());
+
+        let bad_interval: AppConfig = toml::from_str(&format!(
+            "{TLS}[persistence.cleanup]\ninterval = 'nope'\nretention = '7d'\n"
+        ))
+        .expect("parse");
+        assert!(bad_interval.validate().is_err());
+
+        let zero_retention: AppConfig = toml::from_str(&format!(
+            "{TLS}[persistence.cleanup]\ninterval = '1h'\nretention = '0s'\n"
+        ))
+        .expect("parse");
+        assert!(zero_retention.validate().is_err());
     }
 
     #[test]

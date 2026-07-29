@@ -9,9 +9,12 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 pub use adaptive::{AdaptiveBatch, DirectionStreak, Ewma};
-pub use types::{Job, JobQueue, JobStatus, StoreError, unix_now};
+pub use types::{
+    AcceptedJob, Execution, ExecutionStatus, ExecutionWithQueueConfig, Job, JobQueue, StoreError,
+    unix_now,
+};
 
-pub const MAX_CLAIM_BATCH_SIZE: usize = 16_384;
+pub const MAX_CLAIM_BATCH_SIZE: usize = 1_048_576;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
@@ -72,9 +75,9 @@ pub trait DurableStore: Send + Sync {
         name: &str,
     ) -> impl Future<Output = Result<Option<JobQueue>, StoreError>> + Send;
     fn list_queues(&self) -> impl Future<Output = Result<Vec<JobQueue>, StoreError>> + Send;
-    fn enqueue(&self, job: Job) -> impl Future<Output = Result<Job, StoreError>> + Send;
+    fn enqueue(&self, job: AcceptedJob) -> impl Future<Output = Result<AcceptedJob, StoreError>> + Send;
     fn get_job(&self, job_id: i64) -> impl Future<Output = Result<Job, StoreError>> + Send;
-    fn status(&self, job_id: i64) -> impl Future<Output = Result<JobStatus, StoreError>> + Send;
+    fn status(&self, job_id: i64) -> impl Future<Output = Result<ExecutionStatus, StoreError>> + Send;
     fn claim_next(
         &self,
         queue_name: &str,
@@ -116,7 +119,7 @@ pub trait DurableStore: Send + Sync {
         async move {
             Ok(matches!(
                 self.complete(job_id, dispatch_id, outcome).await?,
-                Some(job) if job.status == JobStatus::Pending
+                Some(job) if job.status == ExecutionStatus::Pending
             ))
         }
     }
@@ -199,7 +202,7 @@ pub struct SubmitJob {
 pub struct JobView {
     pub id: i64,
     pub name: String,
-    pub status: JobStatus,
+    pub status: ExecutionStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -282,13 +285,13 @@ impl<
             .map_err(|err| EngineError::Payload(err.to_string()))?;
         let result = self
             .store
-            .enqueue(Job::new_pending(job.name, payload))
+            .enqueue(AcceptedJob::new(job.name, payload))
             .await?;
-        self.ensure_awake(result.name.clone()).await;
+        self.ensure_awake(result.queue_name.clone()).await;
         Ok(JobView {
             id: result.id,
-            name: result.name,
-            status: result.status,
+            name: result.queue_name,
+            status: ExecutionStatus::Pending,
         })
     }
 
@@ -380,7 +383,7 @@ impl<
                     _ = recovery.tick() => {
                         let now = crate::unix_now();
                         if let Ok(recovered) = engine.store.recover_stale_leases(now).await {
-                            let queues = recovered.into_iter().filter(|job| job.status == JobStatus::Pending).map(|job| job.name).collect();
+                            let queues = recovered.into_iter().filter(|job| job.status == ExecutionStatus::Pending).map(|job| job.name).collect();
                             engine.wake_after_pass(queues);
                         }
                     }
@@ -534,9 +537,9 @@ mod tests {
         fn with_pending(count: i64) -> Self {
             let pending = (1..=count)
                 .map(|id| {
-                    let mut job = Job::new_pending("email", vec![]);
-                    job.id = id;
-                    job
+                    let mut accepted = AcceptedJob::new("email", vec![]);
+                    accepted.id = id;
+                    Job::from_accepted(accepted, None)
                 })
                 .collect();
             Self {
@@ -560,8 +563,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn enqueue(&self, job: Job) -> Result<Job, StoreError> {
-            self.pending.lock().unwrap().push_back(job.clone());
+        async fn enqueue(&self, job: AcceptedJob) -> Result<AcceptedJob, StoreError> {
+            self.pending
+                .lock()
+                .unwrap()
+                .push_back(Job::from_accepted(job.clone(), None));
             Ok(job)
         }
 
@@ -569,14 +575,14 @@ mod tests {
             Err(StoreError::NotFound(job_id))
         }
 
-        async fn status(&self, job_id: i64) -> Result<JobStatus, StoreError> {
+        async fn status(&self, job_id: i64) -> Result<ExecutionStatus, StoreError> {
             Err(StoreError::NotFound(job_id))
         }
 
         async fn claim_next(&self, _queue_name: &str) -> Result<Option<Job>, StoreError> {
             let mut job = self.pending.lock().unwrap().pop_front();
             if let Some(job) = &mut job {
-                job.status = JobStatus::Running;
+                job.status = ExecutionStatus::Running;
                 job.execution_count = 1;
                 job.dispatch_id = Some(format!("dispatch-{}", job.id));
                 self.claims.fetch_add(1, Ordering::SeqCst);

@@ -8,23 +8,25 @@ use rusqlite::{Connection, ToSql, TransactionBehavior, params, params_from_iter}
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
-use maqistor_engine::{JobOutcome, StoreError};
+use maqistor_engine::{Execution, JobOutcome, JobQueue, StoreError};
 
-use super::adaptive::{AdaptiveBatchController, FlushReason};
+use super::adaptive::{
+    AdaptiveBatchController, FlushReason, ResultsLane, ResultsLaneController,
+};
 use super::bulk::{self, ROWS_PER_STATEMENT};
 use super::common::{
-    AttemptRow, ReadPool, RwConnection, apply_results_schema, row_to_attempt, unix_now,
+    EXECUTION_WITH_QUEUE_COLUMNS, EXECUTION_WITH_QUEUE_FROM, ReadPool, RwConnection,
+    apply_executions_schema, row_to_execution_with_queue_config, row_to_queue, unix_now,
 };
 use super::options::{DurabilityMode, SqliteWriteOptions};
 
 const CHANNEL_CAPACITY: usize = 1024;
 
-const ATTEMPTS_INSERT_COLUMNS: &[&str] = &[
+const EXECUTIONS_UPSERT_COLUMNS: &[&str] = &[
     "job_id",
     "queue_name",
     "status",
     "execution_count",
-    "max_retries_at_claim",
     "lease_expires_at",
     "dispatch_id",
     "created_at",
@@ -32,13 +34,21 @@ const ATTEMPTS_INSERT_COLUMNS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
-pub(crate) struct RunningInsert {
+pub(crate) struct DispatchInsert {
     pub job_id: i64,
     pub queue_name: String,
     pub dispatch_id: String,
-    pub execution_count: u32,
-    pub max_retries_at_claim: u32,
     pub lease_expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DispatchedExecution {
+    #[allow(dead_code)]
+    pub job_id: i64,
+    pub execution_count: u32,
+    pub dispatch_id: String,
+    pub lease_expires_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +65,13 @@ pub(crate) struct RecoveredStale {
 }
 
 enum ResultsRequest {
-    InsertRunning {
-        rows: Vec<RunningInsert>,
-        reply: oneshot::Sender<Result<(), StoreError>>,
+    UpsertQueue {
+        queue: JobQueue,
+        reply: oneshot::Sender<Result<JobQueue, StoreError>>,
+    },
+    Dispatch {
+        rows: Vec<DispatchInsert>,
+        reply: oneshot::Sender<Result<Vec<DispatchedExecution>, StoreError>>,
     },
     Complete {
         job_id: i64,
@@ -74,6 +88,10 @@ enum ResultsRequest {
         now: i64,
         reply: oneshot::Sender<Result<Vec<RecoveredStale>, StoreError>>,
     },
+    CleanupExpiredRecords {
+        cutoff: i64,
+        reply: oneshot::Sender<Result<usize, StoreError>>,
+    }
 }
 
 struct PendingCompletion {
@@ -81,6 +99,13 @@ struct PendingCompletion {
     dispatch_id: String,
     outcome: JobOutcome,
     reply: oneshot::Sender<Result<CompletionDisposition, StoreError>>,
+    queued_at: Instant,
+}
+
+struct PendingDispatch {
+    rows: Vec<DispatchInsert>,
+    reply: oneshot::Sender<Result<Vec<DispatchedExecution>, StoreError>>,
+    queued_at: Instant,
 }
 
 struct BatchCommit {
@@ -95,13 +120,46 @@ struct ResultsConn {
 impl ResultsConn {
     fn open(path: &Path, durability: DurabilityMode) -> Result<Self, StoreError> {
         let rw = RwConnection::open(path, durability)?;
-        rw.migrate_schema(apply_results_schema)?;
+        rw.migrate_schema(apply_executions_schema)?;
         Ok(Self { conn: rw.conn })
     }
 
-    fn insert_running_batch(&mut self, rows: Vec<RunningInsert>) -> Result<(), StoreError> {
+    fn upsert_queue(&mut self, queue: JobQueue) -> Result<JobQueue, StoreError> {
+        let mut queue = queue;
+        queue.updated_at = unix_now();
+        self.conn
+            .execute(
+                "INSERT INTO execution_queues (name, max_retries, timeout_secs, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(name) DO UPDATE SET
+                    max_retries = excluded.max_retries,
+                    timeout_secs = excluded.timeout_secs,
+                    updated_at = excluded.updated_at",
+                params![
+                    queue.name,
+                    queue.max_retries,
+                    queue.timeout_secs,
+                    queue.created_at,
+                    queue.updated_at,
+                ],
+            )
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        self.conn
+            .query_row(
+                "SELECT name, max_retries, timeout_secs, created_at, updated_at
+                 FROM execution_queues WHERE name = ?1",
+                params![queue.name],
+                row_to_queue,
+            )
+            .map_err(|err| StoreError::Internal(err.to_string()))
+    }
+
+    fn dispatch_batch(
+        &mut self,
+        rows: Vec<DispatchInsert>,
+    ) -> Result<Vec<DispatchedExecution>, StoreError> {
         if rows.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let tx = self
             .conn
@@ -109,28 +167,85 @@ impl ResultsConn {
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         let now = unix_now();
         let status = "running";
+        let execution_count = 1_i64;
+        let mut by_job: std::collections::HashMap<i64, DispatchedExecution> =
+            std::collections::HashMap::with_capacity(rows.len());
+
         for chunk in rows.chunks(ROWS_PER_STATEMENT) {
-            let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 9);
+            let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 8);
             for row in chunk {
                 values.push(&row.job_id);
                 values.push(&row.queue_name);
                 values.push(&status);
-                values.push(&row.execution_count);
-                values.push(&row.max_retries_at_claim);
+                values.push(&execution_count);
                 values.push(&row.lease_expires_at);
                 values.push(&row.dispatch_id);
                 values.push(&now);
                 values.push(&now);
             }
-            bulk::execute_cached_tx(
+            let sql = bulk::upsert_sql(
+                "executions",
+                EXECUTIONS_UPSERT_COLUMNS,
+                chunk.len(),
+                "job_id",
+                "status = 'running', \
+                 execution_count = execution_count + 1, \
+                 dispatch_id = excluded.dispatch_id, \
+                 lease_expires_at = excluded.lease_expires_at, \
+                 result_payload = NULL, \
+                 result_error = NULL, \
+                 updated_at = excluded.updated_at",
+                Some("executions.status IN ('failed', 'pending')"),
+                Some("job_id, execution_count, dispatch_id, updated_at"),
+            );
+            let upserted = bulk::query_pairs_cached_tx(
                 &tx,
-                &bulk::insert_sql("job_attempts", ATTEMPTS_INSERT_COLUMNS, chunk.len()),
+                &sql,
                 params_from_iter(values),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
             )?;
+            let lease_by_id: std::collections::HashMap<i64, i64> = chunk
+                .iter()
+                .map(|row| (row.job_id, row.lease_expires_at))
+                .collect();
+            for (job_id, execution_count, dispatch_id, updated_at) in upserted {
+                let execution_count = u32::try_from(execution_count)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                let lease_expires_at = lease_by_id.get(&job_id).copied().unwrap_or(0);
+                by_job.insert(
+                    job_id,
+                    DispatchedExecution {
+                        job_id,
+                        execution_count,
+                        dispatch_id,
+                        lease_expires_at,
+                        updated_at,
+                    },
+                );
+            }
         }
+
         tx.commit()
             .map_err(|err| StoreError::Internal(err.to_string()))?;
-        Ok(())
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(dispatched) = by_job.remove(&row.job_id) else {
+                return Err(StoreError::Internal(format!(
+                    "dispatch did not produce an execution for job {}",
+                    row.job_id
+                )));
+            };
+            out.push(dispatched);
+        }
+        Ok(out)
     }
 
     fn complete_batch(&mut self, batch: Vec<PendingCompletion>) -> Option<BatchCommit> {
@@ -169,15 +284,15 @@ impl ResultsConn {
                     values.push(&now);
                 }
                 let sql = bulk::update_from_values_sql(
-                    "job_attempts",
+                    "executions",
                     "v",
                     "status = 'completed', lease_expires_at = NULL, \
                      result_payload = v.payload, result_error = NULL, updated_at = v.updated_at",
                     &["job_id", "dispatch_id", "payload", "updated_at"],
                     chunk.len(),
-                    "job_attempts.job_id = v.job_id AND job_attempts.dispatch_id = v.dispatch_id \
-                     AND job_attempts.status = 'running'",
-                    Some("job_attempts.job_id, job_attempts.dispatch_id"),
+                    "executions.job_id = v.job_id AND executions.dispatch_id = v.dispatch_id \
+                     AND executions.status = 'running'",
+                    Some("executions.job_id, executions.dispatch_id"),
                 );
                 let updated = bulk::query_pairs_cached_tx(
                     &tx,
@@ -207,17 +322,17 @@ impl ResultsConn {
                     values.push(&now);
                 }
                 let sql = bulk::update_from_values_sql(
-                    "job_attempts",
+                    "executions",
                     "v",
                     "status = 'failed', lease_expires_at = NULL, \
                      result_error = v.message, updated_at = v.updated_at",
                     &["job_id", "dispatch_id", "message", "updated_at"],
                     chunk.len(),
-                    "job_attempts.job_id = v.job_id AND job_attempts.dispatch_id = v.dispatch_id \
-                     AND job_attempts.status = 'running'",
+                    "executions.job_id = v.job_id AND executions.dispatch_id = v.dispatch_id \
+                     AND executions.status = 'running'",
                     Some(
-                        "job_attempts.job_id, job_attempts.dispatch_id, \
-                         job_attempts.execution_count, job_attempts.max_retries_at_claim",
+                        "executions.job_id, executions.dispatch_id, \
+                         executions.execution_count, executions.queue_name",
                     ),
                 );
                 let updated = bulk::query_pairs_cached_tx(
@@ -229,13 +344,29 @@ impl ResultsConn {
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )?;
+                let mut queue_limits: std::collections::HashMap<String, i64> =
+                    std::collections::HashMap::new();
+                for (_, _, _, queue_name) in &updated {
+                    if queue_limits.contains_key(queue_name) {
+                        continue;
+                    }
+                    let max_retries: i64 = tx
+                        .query_row(
+                            "SELECT max_retries FROM execution_queues WHERE name = ?1",
+                            params![queue_name],
+                            |row| row.get(0),
+                        )
+                        .map_err(|err| StoreError::Internal(err.to_string()))?;
+                    queue_limits.insert(queue_name.clone(), max_retries);
+                }
                 let by_key: std::collections::HashMap<(i64, String), (i64, i64)> = updated
                     .into_iter()
-                    .map(|(job_id, dispatch_id, execution_count, max_retries)| {
+                    .map(|(job_id, dispatch_id, execution_count, queue_name)| {
+                        let max_retries = queue_limits.get(&queue_name).copied().unwrap_or(0);
                         ((job_id, dispatch_id), (execution_count, max_retries))
                     })
                     .collect();
@@ -280,7 +411,7 @@ impl ResultsConn {
     fn abandon(&mut self, job_id: i64, dispatch_id: &str) -> Result<(), StoreError> {
         self.conn
             .execute(
-                "UPDATE job_attempts SET status = 'failed', lease_expires_at = NULL,
+                "UPDATE executions SET status = 'failed', lease_expires_at = NULL,
                  result_error = 'abandoned', updated_at = ?1
                  WHERE job_id = ?2 AND dispatch_id = ?3 AND status = 'running'",
                 params![unix_now(), job_id, dispatch_id],
@@ -293,47 +424,103 @@ impl ResultsConn {
         &mut self,
         now: i64,
     ) -> Result<Vec<RecoveredStale>, StoreError> {
+        let sql = format!(
+            "SELECT {EXECUTION_WITH_QUEUE_COLUMNS}
+             {EXECUTION_WITH_QUEUE_FROM}
+             WHERE e.status = 'running'
+               AND e.lease_expires_at IS NOT NULL
+               AND e.lease_expires_at < ?1"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, job_id, queue_name, status, execution_count, max_retries_at_claim,
-                        lease_expires_at, dispatch_id, result_payload, result_error, created_at, updated_at
-                 FROM job_attempts
-                 WHERE status = 'running'
-                   AND lease_expires_at IS NOT NULL
-                   AND lease_expires_at < ?1",
-            )
+            .prepare(&sql)
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         let stale = stmt
-            .query_map(params![now], row_to_attempt)
+            .query_map(params![now], row_to_execution_with_queue_config)
             .map_err(|err| StoreError::Internal(err.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| StoreError::Internal(err.to_string()))?;
+        drop(stmt);
 
-        let mut recovered = Vec::with_capacity(stale.len());
-        for attempt in stale {
-            let should_repend = attempt.execution_count <= attempt.max_retries_at_claim;
-            self.conn
-                .execute(
-                    "UPDATE job_attempts SET status = 'failed', lease_expires_at = NULL,
-                     result_error = 'lease expired', updated_at = ?1
-                     WHERE id = ?2 AND status = 'running'",
-                    params![now, attempt.id],
-                )
-                .map_err(|err| StoreError::Internal(err.to_string()))?;
-            recovered.push(RecoveredStale {
-                job_id: attempt.job_id,
-                dispatch_id: attempt.dispatch_id,
-                should_repend,
-            });
+        if stale.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let limits: std::collections::HashMap<i64, u32> = stale
+            .iter()
+            .map(|item| (item.execution.id, item.queue.max_retries))
+            .collect();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        let mut recovered = Vec::with_capacity(stale.len());
+        for chunk in stale.chunks(ROWS_PER_STATEMENT) {
+            let ids: Vec<i64> = chunk.iter().map(|item| item.execution.id).collect();
+            let mut values: Vec<&dyn ToSql> = Vec::with_capacity(ids.len() * 2);
+            for id in &ids {
+                values.push(id);
+                values.push(&now);
+            }
+            let sql = bulk::update_from_values_sql(
+                "executions",
+                "v",
+                "status = 'failed', lease_expires_at = NULL, \
+                 result_error = 'lease expired', updated_at = v.updated_at",
+                &["id", "updated_at"],
+                ids.len(),
+                "executions.id = v.id AND executions.status = 'running'",
+                Some(
+                    "executions.id, executions.job_id, executions.dispatch_id, \
+                     executions.execution_count",
+                ),
+            );
+            let updated = bulk::query_pairs_cached_tx(
+                &tx,
+                &sql,
+                params_from_iter(values),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            for (id, job_id, dispatch_id, execution_count) in updated {
+                let execution_count = u32::try_from(execution_count)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                let max_retries = limits.get(&id).copied().unwrap_or(0);
+                recovered.push(RecoveredStale {
+                    job_id,
+                    dispatch_id,
+                    should_repend: execution_count <= max_retries,
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(recovered)
+    }
+
+    fn cleanup_expired_records(&mut self, cutoff: i64) -> Result<usize, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("DELETE FROM executions WHERE updated_at < ?1")
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        let rows_affected = statement.execute(params![cutoff])
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        Ok(rows_affected)
     }
 
     fn handle(&mut self, request: ResultsRequest) {
         match request {
-            ResultsRequest::InsertRunning { rows, reply } => {
-                let _ = reply.send(self.insert_running_batch(rows));
+            ResultsRequest::UpsertQueue { queue, reply } => {
+                let _ = reply.send(self.upsert_queue(queue));
+            }
+            ResultsRequest::Dispatch { rows, reply } => {
+                let _ = reply.send(self.dispatch_batch(rows));
             }
             ResultsRequest::Complete {
                 job_id,
@@ -346,6 +533,7 @@ impl ResultsConn {
                     dispatch_id,
                     outcome,
                     reply,
+                    queued_at: Instant::now(),
                 }]);
             }
             ResultsRequest::Abandon {
@@ -357,6 +545,9 @@ impl ResultsConn {
             }
             ResultsRequest::RecoverStale { now, reply } => {
                 let _ = reply.send(self.recover_stale(now));
+            }
+            ResultsRequest::CleanupExpiredRecords { cutoff, reply } => {
+                let _ = reply.send(self.cleanup_expired_records(cutoff));
             }
         }
     }
@@ -427,8 +618,16 @@ impl ResultsHandle {
             .map_err(|_| StoreError::Internal("results writer dropped reply".into()))?
     }
 
-    pub(crate) async fn insert_running(&self, rows: Vec<RunningInsert>) -> Result<(), StoreError> {
-        self.call(|reply| ResultsRequest::InsertRunning { rows, reply })
+    pub(crate) async fn upsert_queue(&self, queue: JobQueue) -> Result<JobQueue, StoreError> {
+        self.call(|reply| ResultsRequest::UpsertQueue { queue, reply })
+            .await
+    }
+
+    pub(crate) async fn dispatch(
+        &self,
+        rows: Vec<DispatchInsert>,
+    ) -> Result<Vec<DispatchedExecution>, StoreError> {
+        self.call(|reply| ResultsRequest::Dispatch { rows, reply })
             .await
     }
 
@@ -467,21 +666,28 @@ impl ResultsHandle {
         .await
     }
 
-    pub(crate) async fn latest_attempt(&self, job_id: i64) -> Result<Option<AttemptRow>, StoreError> {
-        self.reads.latest_attempt(job_id).await
+    pub(crate) async fn execution(
+        &self,
+        job_id: i64,
+    ) -> Result<Option<Execution>, StoreError> {
+        self.reads.execution(job_id).await
+    }
+
+    pub(crate) async fn cleanup_expired_records(&self, cutoff: i64) -> Result<usize, StoreError> {
+        self.call(|reply| ResultsRequest::CleanupExpiredRecords { cutoff, reply })
+            .await
     }
 }
 
 struct ResultsQueues {
     meta: VecDeque<ResultsRequest>,
-    insert: VecDeque<ResultsRequest>,
+    dispatch: VecDeque<PendingDispatch>,
     complete: VecDeque<PendingCompletion>,
-    complete_wait_since: Option<Instant>,
 }
 
 impl ResultsQueues {
     fn is_empty(&self) -> bool {
-        self.meta.is_empty() && self.insert.is_empty() && self.complete.is_empty()
+        self.meta.is_empty() && self.dispatch.is_empty() && self.complete.is_empty()
     }
 
     fn push(&mut self, request: ResultsRequest) {
@@ -491,21 +697,35 @@ impl ResultsQueues {
                 dispatch_id,
                 outcome,
                 reply,
-            } => {
-                if self.complete.is_empty() {
-                    self.complete_wait_since = Some(Instant::now());
-                }
-                self.complete.push_back(PendingCompletion {
-                    job_id,
-                    dispatch_id,
-                    outcome,
-                    reply,
-                });
-            }
-            ResultsRequest::InsertRunning { .. } => self.insert.push_back(request),
-            ResultsRequest::Abandon { .. }
-            | ResultsRequest::RecoverStale { .. } => self.meta.push_back(request),
+            } => self.complete.push_back(PendingCompletion {
+                job_id,
+                dispatch_id,
+                outcome,
+                reply,
+                queued_at: Instant::now(),
+            }),
+            ResultsRequest::Dispatch { rows, reply } => self.dispatch.push_back(PendingDispatch {
+                rows,
+                reply,
+                queued_at: Instant::now(),
+            }),
+            ResultsRequest::UpsertQueue { .. }
+            | ResultsRequest::Abandon { .. }
+            | ResultsRequest::RecoverStale { .. }
+            | ResultsRequest::CleanupExpiredRecords { .. } => self.meta.push_back(request),
         }
+    }
+
+    fn dispatch_rows(&self) -> usize {
+        self.dispatch.iter().map(|pending| pending.rows.len()).sum()
+    }
+
+    fn dispatch_oldest(&self) -> Option<Instant> {
+        self.dispatch.front().map(|pending| pending.queued_at)
+    }
+
+    fn completion_oldest(&self) -> Option<Instant> {
+        self.complete.front().map(|pending| pending.queued_at)
     }
 }
 
@@ -516,11 +736,11 @@ async fn results_writer_loop(
 ) {
     let mut queues = ResultsQueues {
         meta: VecDeque::new(),
-        insert: VecDeque::new(),
+        dispatch: VecDeque::new(),
         complete: VecDeque::new(),
-        complete_wait_since: None,
     };
     let mut controller = AdaptiveBatchController::new(&completion_options);
+    let mut lane_controller = ResultsLaneController::new(completion_options.ewma_window);
 
     loop {
         if queues.is_empty() {
@@ -538,30 +758,48 @@ async fn results_writer_loop(
             conn.handle(request);
             continue;
         }
-        if !queues.insert.is_empty() {
-            while let Some(ResultsRequest::InsertRunning { rows, reply }) =
-                queues.insert.pop_front()
-            {
-                let _ = reply.send(conn.insert_running_batch(rows));
-            }
-            continue;
-        }
-        if !queues.complete.is_empty() {
-            let disconnected =
-                run_complete_turn(&mut conn, &mut rx, &mut queues, &mut controller).await;
+        let dispatch_rows = queues.dispatch_rows();
+        let completion_rows = queues.complete.len();
+        if let Some((lane, selection_reason)) = lane_controller.select(
+            dispatch_rows,
+            queues.dispatch_oldest(),
+            completion_rows,
+            queues.completion_oldest(),
+            Instant::now(),
+        ) {
+            debug!(
+                ?lane,
+                ?selection_reason,
+                dispatch_rows,
+                completion_rows,
+                "results writer lane selected"
+            );
+            let disconnected = match lane {
+                ResultsLane::Dispatch => {
+                    run_dispatch_turn(&mut conn, &mut queues, &mut lane_controller);
+                    false
+                }
+                ResultsLane::Completion => {
+                    run_complete_turn(
+                        &mut conn,
+                        &mut rx,
+                        &mut queues,
+                        &mut controller,
+                        &mut lane_controller,
+                    )
+                    .await
+                }
+            };
             if disconnected {
                 flush_complete(&mut conn, &mut queues, &mut controller, rx.len());
                 while let Some(request) = queues.meta.pop_front() {
                     conn.handle(request);
                 }
-                while let Some(ResultsRequest::InsertRunning { rows, reply }) =
-                    queues.insert.pop_front()
-                {
-                    let _ = reply.send(conn.insert_running_batch(rows));
+                while let Some(pending) = queues.dispatch.pop_front() {
+                    let _ = pending.reply.send(conn.dispatch_batch(pending.rows));
                 }
                 return;
             }
-            continue;
         }
     }
 
@@ -576,6 +814,7 @@ async fn run_complete_turn(
     rx: &mut mpsc::Receiver<ResultsRequest>,
     queues: &mut ResultsQueues,
     controller: &mut AdaptiveBatchController,
+    lane_controller: &mut ResultsLaneController,
 ) -> bool {
     let mut pending = Vec::new();
     let target = controller.batch_size();
@@ -583,9 +822,6 @@ async fn run_complete_turn(
         let Some(item) = queues.complete.pop_front() else {
             break;
         };
-        if queues.complete.is_empty() {
-            queues.complete_wait_since = None;
-        }
         controller.observe_request(Instant::now());
         pending.push(item);
     }
@@ -613,12 +849,13 @@ async fn run_complete_turn(
                     dispatch_id,
                     outcome,
                     reply,
+                    queued_at: Instant::now(),
                 });
             }
             Ok(Some(request)) => {
                 let preempt = matches!(
                     request,
-                    ResultsRequest::InsertRunning { .. }
+                    ResultsRequest::UpsertQueue { .. }
                         | ResultsRequest::Abandon { .. }
                         | ResultsRequest::RecoverStale { .. }
                 );
@@ -642,6 +879,7 @@ async fn run_complete_turn(
         FlushReason::Timeout
     };
     if let Some(commit) = conn.complete_batch(pending) {
+        lane_controller.observe_success(ResultsLane::Completion, commit.count, commit.duration);
         controller.record_successful_commit(
             filled.min(commit.count),
             commit.duration,
@@ -658,7 +896,26 @@ async fn run_complete_turn(
             "adaptive results batch updated"
         );
     }
+    lane_controller.record_turn(ResultsLane::Completion);
     disconnected
+}
+
+fn run_dispatch_turn(
+    conn: &mut ResultsConn,
+    queues: &mut ResultsQueues,
+    lane_controller: &mut ResultsLaneController,
+) {
+    let Some(pending) = queues.dispatch.pop_front() else {
+        return;
+    };
+    let rows = pending.rows.len();
+    let started = Instant::now();
+    let result = conn.dispatch_batch(pending.rows);
+    if result.is_ok() {
+        lane_controller.observe_success(ResultsLane::Dispatch, rows, started.elapsed());
+    }
+    let _ = pending.reply.send(result);
+    lane_controller.record_turn(ResultsLane::Dispatch);
 }
 
 fn flush_complete(
@@ -669,7 +926,6 @@ fn flush_complete(
 ) {
     if !queues.complete.is_empty() {
         let batch: Vec<_> = queues.complete.drain(..).collect();
-        queues.complete_wait_since = None;
         let filled = batch.len();
         if let Some(commit) = conn.complete_batch(batch) {
             controller.record_successful_commit(
@@ -680,5 +936,283 @@ fn flush_complete(
                 FlushReason::Timeout,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod results_writer_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn dispatch(job_id: i64, dispatch_id: &str) -> DispatchInsert {
+        DispatchInsert {
+            job_id,
+            queue_name: "email".into(),
+            dispatch_id: dispatch_id.into(),
+            lease_expires_at: unix_now() + 60_000,
+        }
+    }
+
+    fn pending_completion(job_id: i64, dispatch_id: &str) -> PendingCompletion {
+        let (reply, _rx) = oneshot::channel();
+        PendingCompletion {
+            job_id,
+            dispatch_id: dispatch_id.into(),
+            outcome: JobOutcome::Succeeded(Vec::new()),
+            reply,
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn pending_dispatch(job_id: i64, dispatch_id: &str) -> PendingDispatch {
+        let (reply, _rx) = oneshot::channel();
+        PendingDispatch {
+            rows: vec![dispatch(job_id, dispatch_id)],
+            reply,
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn single_item_completion_options() -> super::super::options::BatchOptions {
+        super::super::options::BatchOptions {
+            batch_size_min: 1,
+            batch_size_max: 1,
+            batch_wait_min: Duration::from_millis(1),
+            batch_wait_max: Duration::from_millis(10),
+            ..super::super::options::BatchOptions::completion_defaults()
+        }
+    }
+
+    fn remove_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_preempt_an_open_completion_batch() {
+        let path = std::env::temp_dir().join(format!("maqistor-results-{}.db", Uuid::new_v4()));
+        let mut conn = ResultsConn::open(&path, DurabilityMode::Balanced).unwrap();
+        conn.upsert_queue(JobQueue::new("email")).unwrap();
+        conn.dispatch_batch(vec![dispatch(1, "first")]).unwrap();
+
+        let (completion_reply, _completion_rx) = oneshot::channel();
+        let mut queues = ResultsQueues {
+            meta: VecDeque::new(),
+            dispatch: VecDeque::new(),
+            complete: VecDeque::from([PendingCompletion {
+                job_id: 1,
+                dispatch_id: "first".into(),
+                outcome: JobOutcome::Succeeded(Vec::new()),
+                reply: completion_reply,
+                queued_at: Instant::now(),
+            }]),
+        };
+        let options = super::super::options::BatchOptions {
+            batch_size_min: 2,
+            batch_size_max: 2,
+            batch_wait_min: Duration::from_millis(1),
+            batch_wait_max: Duration::from_millis(10),
+            ..super::super::options::BatchOptions::completion_defaults()
+        };
+        let mut batch_controller = AdaptiveBatchController::new(&options);
+        let mut lane_controller = ResultsLaneController::new(options.ewma_window);
+        let (tx, mut rx) = mpsc::channel(1);
+        let (dispatch_reply, mut dispatch_rx) = oneshot::channel();
+        tx.send(ResultsRequest::Dispatch {
+            rows: vec![dispatch(2, "second")],
+            reply: dispatch_reply,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !run_complete_turn(
+                &mut conn,
+                &mut rx,
+                &mut queues,
+                &mut batch_controller,
+                &mut lane_controller,
+            )
+            .await
+        );
+        assert_eq!(queues.dispatch.len(), 1);
+        assert!(matches!(
+            dispatch_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let status: String = conn
+            .conn
+            .query_row(
+                "SELECT status FROM executions WHERE job_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+
+        drop(conn);
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn sustained_dispatch_turns_cannot_starve_a_queued_completion() {
+        let path = std::env::temp_dir().join(format!("maqistor-results-{}.db", Uuid::new_v4()));
+        let mut conn = ResultsConn::open(&path, DurabilityMode::Balanced).unwrap();
+        conn.upsert_queue(JobQueue::new("email")).unwrap();
+        conn.dispatch_batch(vec![dispatch(1, "completed")]).unwrap();
+
+        let mut queues = ResultsQueues {
+            meta: VecDeque::new(),
+            dispatch: (2..=34)
+                .map(|job_id| pending_dispatch(job_id, &format!("dispatch-{job_id}")))
+                .collect(),
+            complete: VecDeque::from([pending_completion(1, "completed")]),
+        };
+        let options = single_item_completion_options();
+        let mut batch_controller = AdaptiveBatchController::new(&options);
+        let mut lane_controller = ResultsLaneController::new(1);
+        lane_controller.observe_success(ResultsLane::Dispatch, 1, Duration::from_millis(1));
+        lane_controller.observe_success(ResultsLane::Completion, 1, Duration::from_millis(1));
+        let now = Instant::now();
+        for turn in 0..3 {
+            let (lane, _) = lane_controller
+                .select(
+                    queues.dispatch_rows(),
+                    queues.dispatch_oldest(),
+                    queues.complete.len(),
+                    queues.completion_oldest(),
+                    now,
+                )
+                .unwrap();
+            assert_eq!(
+                lane,
+                if turn < 2 {
+                    ResultsLane::Completion
+                } else {
+                    ResultsLane::Dispatch
+                }
+            );
+        }
+
+        let (_tx, mut rx) = mpsc::channel(1);
+        let mut completed = false;
+        for _ in 0..=32 {
+            let (lane, _) = lane_controller
+                .select(
+                    queues.dispatch_rows(),
+                    queues.dispatch_oldest(),
+                    queues.complete.len(),
+                    queues.completion_oldest(),
+                    Instant::now(),
+                )
+                .unwrap();
+            match lane {
+                ResultsLane::Dispatch => run_dispatch_turn(&mut conn, &mut queues, &mut lane_controller),
+                ResultsLane::Completion => {
+                    run_complete_turn(
+                        &mut conn,
+                        &mut rx,
+                        &mut queues,
+                        &mut batch_controller,
+                        &mut lane_controller,
+                    )
+                    .await;
+                    completed = true;
+                    break;
+                }
+            }
+        }
+        assert!(completed, "completion should run within the liveness cap");
+
+        let status: String = conn
+            .conn
+            .query_row("SELECT status FROM executions WHERE job_id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "completed");
+
+        drop(conn);
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn sustained_completion_turns_cannot_starve_a_queued_dispatch() {
+        let path = std::env::temp_dir().join(format!("maqistor-results-{}.db", Uuid::new_v4()));
+        let mut conn = ResultsConn::open(&path, DurabilityMode::Balanced).unwrap();
+        conn.upsert_queue(JobQueue::new("email")).unwrap();
+        let completed_jobs: Vec<_> = (1..=33)
+            .map(|job_id| dispatch(job_id, &format!("complete-{job_id}")))
+            .collect();
+        conn.dispatch_batch(completed_jobs).unwrap();
+
+        let (dispatch_reply, dispatch_rx) = oneshot::channel();
+        let mut queues = ResultsQueues {
+            meta: VecDeque::new(),
+            dispatch: VecDeque::from([PendingDispatch {
+                rows: vec![dispatch(100, "dispatch")],
+                reply: dispatch_reply,
+                queued_at: Instant::now(),
+            }]),
+            complete: (1..=33)
+                .map(|job_id| pending_completion(job_id, &format!("complete-{job_id}")))
+                .collect(),
+        };
+        let options = single_item_completion_options();
+        let mut batch_controller = AdaptiveBatchController::new(&options);
+        let mut lane_controller = ResultsLaneController::new(1);
+        lane_controller.observe_success(ResultsLane::Dispatch, 1, Duration::from_millis(1));
+        lane_controller.observe_success(ResultsLane::Completion, 1, Duration::from_millis(1));
+        let now = Instant::now();
+        for _ in 0..3 {
+            let (lane, _) = lane_controller
+                .select(
+                    queues.dispatch_rows(),
+                    queues.dispatch_oldest(),
+                    queues.complete.len(),
+                    queues.completion_oldest(),
+                    now,
+                )
+                .unwrap();
+            assert_eq!(lane, ResultsLane::Completion);
+        }
+
+        let (_tx, mut rx) = mpsc::channel(1);
+        for _ in 0..32 {
+            let (lane, _) = lane_controller
+                .select(
+                    queues.dispatch_rows(),
+                    queues.dispatch_oldest(),
+                    queues.complete.len(),
+                    queues.completion_oldest(),
+                    Instant::now(),
+                )
+                .unwrap();
+            assert_eq!(lane, ResultsLane::Completion);
+            run_complete_turn(
+                &mut conn,
+                &mut rx,
+                &mut queues,
+                &mut batch_controller,
+                &mut lane_controller,
+            )
+            .await;
+        }
+        let (lane, _) = lane_controller
+            .select(
+                queues.dispatch_rows(),
+                queues.dispatch_oldest(),
+                queues.complete.len(),
+                queues.completion_oldest(),
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(lane, ResultsLane::Dispatch);
+        run_dispatch_turn(&mut conn, &mut queues, &mut lane_controller);
+        assert!(dispatch_rx.await.unwrap().is_ok());
+
+        drop(conn);
+        remove_database(&path);
     }
 }

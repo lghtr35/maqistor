@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+humantime.workspace = true
 maqistor-api.workspace = true
 maqistor-dispatcher.workspace = true
 maqistor-engine.workspace = true

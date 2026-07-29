@@ -7,9 +7,10 @@ use maqistor_dispatcher::{
 use maqistor_engine::{DurableStore, Engine, JobQueue, unix_now};
 use maqistor_persistence::SqliteStore;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{debug, error, info};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use config::{QueueMode, StartupPolicy};
+use config::{CleanupConfig, StartupPolicy};
 
 mod config;
 
@@ -71,18 +72,19 @@ async fn main() -> anyhow::Result<()> {
         config
             .queues
             .iter()
-            .filter(|q| q.mode == QueueMode::Managed)
+            .filter(|q| q.managed_config.is_some())
             .map(|q| ManagedQueue {
                 name: q.name.clone(),
-                image: q.image.clone().expect("validated managed image"),
+                image: q.managed_config.as_ref().map(|c| c.image.clone()).expect("validated managed image"),
                 replicas: q.replicas(),
+                env: q.managed_config.as_ref().map(|c| c.env().expect("validated managed env")).unwrap_or_default(),
             })
             .collect(),
     )
     .map_err(|err| anyhow::anyhow!("initialize managed worker supervisor: {err}"))?
     .spawn();
     let engine = Engine::with_dispatcher(
-        store,
+        store.clone(),
         RegistryDispatcher::new(worker_registry.clone()),
         config.dispatch.options()?,
     );
@@ -103,6 +105,38 @@ async fn main() -> anyhow::Result<()> {
         startup = ?config.persistence.startup,
         "maqistor listening"
     );
+    if let Some(cleanup_config) = &config.persistence.cleanup {
+        start_cleanup_task(&store, cleanup_config)?;
+    }
     axum::serve(listener, maqistor_api::router(engine)).await?;
     Ok(())
+}
+
+fn start_cleanup_task(store: &SqliteStore, config: &CleanupConfig) -> anyhow::Result<()> {
+    let interval = config.interval()?;
+    let retention = config.retention()?;
+    let store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            cleanup_task(&store, retention).await;
+        }
+    });
+    Ok(())
+}
+
+async fn cleanup_task(store: &SqliteStore, retention: std::time::Duration) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis();
+        let cutoff = now.saturating_sub(retention.as_millis());
+        let result = store.cleanup_expired_records(cutoff as i64).await;
+        match result {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    debug!("deleted {} expired jobs", deleted);
+                }
+            }
+            Err(err) => {
+                error!("cleanup expired records: {err}");
+            }
+        }
 }

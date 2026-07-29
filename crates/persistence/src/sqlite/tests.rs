@@ -1,8 +1,8 @@
-use std::path::Path;
+﻿use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::*;
-use maqistor_engine::{DurableStore, Ewma, Job, JobOutcome, JobQueue, JobStatus, StoreError};
+use maqistor_engine::{AcceptedJob, DurableStore, Ewma, JobOutcome, JobQueue, ExecutionStatus, StoreError};
 use uuid::Uuid;
 
 fn cleanup_store(path: &Path) {
@@ -24,7 +24,7 @@ async fn persists_queues_and_jobs_across_reopen() {
             .await
             .expect("upsert queue");
         let job = store
-            .enqueue(Job::new_pending("email", b"payload".to_vec()))
+            .enqueue(AcceptedJob::new("email", b"payload".to_vec()))
             .await
             .expect("enqueue");
         job.id
@@ -36,11 +36,11 @@ async fn persists_queues_and_jobs_across_reopen() {
     assert_eq!(queues[0].name, "email");
 
     let job = store.get_job(job_id).await.expect("get job");
-    assert_eq!(job.status, JobStatus::Pending);
+    assert_eq!(job.status, ExecutionStatus::Pending);
     assert_eq!(job.payload, b"payload");
 
     let reopened_job = store
-        .enqueue(Job::new_pending("email", b"after-reopen".to_vec()))
+        .enqueue(AcceptedJob::new("email", b"after-reopen".to_vec()))
         .await
         .expect("enqueue through reloaded queue cache");
     assert_eq!(
@@ -62,7 +62,7 @@ async fn claim_and_recover_stale_lease() {
         .await
         .expect("upsert queue");
     let job = store
-        .enqueue(Job::new_pending("email", vec![]))
+        .enqueue(AcceptedJob::new("email", vec![]))
         .await
         .expect("enqueue");
 
@@ -72,7 +72,7 @@ async fn claim_and_recover_stale_lease() {
         .expect("claim")
         .expect("claimed job");
     assert_eq!(claimed.id, job.id);
-    assert_eq!(claimed.status, JobStatus::Running);
+    assert_eq!(claimed.status, ExecutionStatus::Running);
     assert!(
         claimed.created_at > 1_000_000_000_000,
         "created_at should be unix millis"
@@ -88,7 +88,7 @@ async fn claim_and_recover_stale_lease() {
         .await
         .expect("recover");
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].status, JobStatus::Pending);
+    assert_eq!(recovered[0].status, ExecutionStatus::Pending);
     assert_eq!(recovered[0].execution_count, 1);
 
     let _ = std::fs::remove_file(path);
@@ -101,9 +101,9 @@ async fn fifo_claims_increment_counts_and_fence_results() {
     let mut queue = JobQueue::new("email");
     queue.max_retries = 1;
     store.upsert_queue(queue).await.unwrap();
-    let mut first = Job::new_pending("email", b"first".to_vec());
+    let mut first = AcceptedJob::new("email", b"first".to_vec());
     first.created_at = 10;
-    let mut second = Job::new_pending("email", b"second".to_vec());
+    let mut second = AcceptedJob::new("email", b"second".to_vec());
     second.created_at = 10;
     let first = store.enqueue(first).await.unwrap();
     let second = store.enqueue(second).await.unwrap();
@@ -134,13 +134,25 @@ async fn fifo_claims_increment_counts_and_fence_results() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(retry.status, JobStatus::Pending);
+    assert_eq!(retry.status, ExecutionStatus::Pending);
     assert_eq!(retry.execution_count, 1);
     assert_eq!(retry.created_at, 10);
 
     let retry = store.claim_next("email").await.unwrap().unwrap();
     assert_eq!(retry.id, first.id);
     assert_eq!(retry.execution_count, 2);
+
+    let results_path = default_results_path(&path);
+    let results = rusqlite::Connection::open(&results_path).unwrap();
+    let execution_rows: i64 = results
+        .query_row(
+            "SELECT COUNT(*) FROM executions WHERE job_id = ?1",
+            rusqlite::params![first.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(execution_rows, 1, "execution must stay 1:1 with job across retries");
+
     let terminal = store
         .complete(
             first.id,
@@ -150,49 +162,36 @@ async fn fifo_claims_increment_counts_and_fence_results() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(terminal.status, JobStatus::Failed);
+    assert_eq!(terminal.status, ExecutionStatus::Failed);
     assert_eq!(terminal.result_error.as_deref(), Some("final"));
 }
 
 #[tokio::test]
-async fn retries_use_policy_snapshotted_when_claimed() {
+async fn retries_use_live_queue_policy_on_complete() {
     let path = std::env::temp_dir().join(format!("maqistor-test-{}.db", Uuid::new_v4()));
     let store = SqliteStore::open(&path).unwrap();
     let mut queue = JobQueue::new("email");
     queue.max_retries = 1;
     store.upsert_queue(queue.clone()).await.unwrap();
     let job = store
-        .enqueue(Job::new_pending("email", vec![]))
+        .enqueue(AcceptedJob::new("email", vec![]))
         .await
         .unwrap();
 
     let first = store.claim_next("email").await.unwrap().unwrap();
     queue.max_retries = 0;
     store.upsert_queue(queue).await.unwrap();
-    let retry = store
+    let terminal = store
         .complete(
             first.id,
             first.dispatch_id.as_deref().unwrap(),
-            JobOutcome::Failed("retry under snapshotted policy".into()),
+            JobOutcome::Failed("live policy disallows retry".into()),
         )
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(retry.status, JobStatus::Pending);
-
-    let second = store.claim_next("email").await.unwrap().unwrap();
-    assert_eq!(second.id, job.id);
-    assert_eq!(second.execution_count, 2);
-    let terminal = store
-        .complete(
-            second.id,
-            second.dispatch_id.as_deref().unwrap(),
-            JobOutcome::Failed("new policy disallows retry".into()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(terminal.status, JobStatus::Failed);
+    assert_eq!(terminal.status, ExecutionStatus::Failed);
+    assert_eq!(terminal.id, job.id);
 }
 
 #[tokio::test]
@@ -201,7 +200,7 @@ async fn worker_result_completion_is_fenced_and_lightweight() {
     let store = SqliteStore::open(&path).unwrap();
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     let job = store
-        .enqueue(Job::new_pending("email", vec![]))
+        .enqueue(AcceptedJob::new("email", vec![]))
         .await
         .unwrap();
     let claimed = store.claim_next("email").await.unwrap().unwrap();
@@ -215,7 +214,7 @@ async fn worker_result_completion_is_fenced_and_lightweight() {
         .complete_worker_result(job.id, dispatch_id, JobOutcome::Succeeded(vec![]))
         .await
         .unwrap());
-    assert_eq!(store.get_job(job.id).await.unwrap().status, JobStatus::Completed);
+    assert_eq!(store.get_job(job.id).await.unwrap().status, ExecutionStatus::Completed);
 }
 
 #[tokio::test]
@@ -224,11 +223,11 @@ async fn fifo_uses_timestamp_then_id_and_preserves_position_after_release() {
     let store = SqliteStore::open(&path).unwrap();
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
 
-    let mut later = Job::new_pending("email", b"later".to_vec());
+    let mut later = AcceptedJob::new("email", b"later".to_vec());
     later.created_at = 20;
-    let mut first = Job::new_pending("email", b"first".to_vec());
+    let mut first = AcceptedJob::new("email", b"first".to_vec());
     first.created_at = 10;
-    let mut second = Job::new_pending("email", b"second".to_vec());
+    let mut second = AcceptedJob::new("email", b"second".to_vec());
     second.created_at = 10;
     let later = store.enqueue(later).await.unwrap();
     let first = store.enqueue(first).await.unwrap();
@@ -266,7 +265,7 @@ async fn claim_batch_exceeds_sixty_four_and_persists_success_payload() {
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     for _ in 0..65 {
         store
-            .enqueue(Job::new_pending("email", vec![]))
+            .enqueue(AcceptedJob::new("email", vec![]))
             .await
             .unwrap();
     }
@@ -303,11 +302,11 @@ async fn completion_results_share_a_bounded_group_commit() {
     let store = SqliteStore::open_with_options(&path, options).unwrap();
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     store
-        .enqueue(Job::new_pending("email", vec![1]))
+        .enqueue(AcceptedJob::new("email", vec![1]))
         .await
         .unwrap();
     store
-        .enqueue(Job::new_pending("email", vec![2]))
+        .enqueue(AcceptedJob::new("email", vec![2]))
         .await
         .unwrap();
     let claimed = store.claim_batch("email", 2).await.unwrap();
@@ -339,11 +338,11 @@ async fn completion_results_share_a_bounded_group_commit() {
     });
     assert_eq!(
         one.await.unwrap().unwrap().unwrap().status,
-        JobStatus::Completed
+        ExecutionStatus::Completed
     );
     assert_eq!(
         two.await.unwrap().unwrap().unwrap().status,
-        JobStatus::Completed
+        ExecutionStatus::Completed
     );
 }
 
@@ -363,7 +362,7 @@ async fn enqueue_is_not_starved_while_a_completion_batch_is_open() {
     let store = SqliteStore::open_with_options(&path, options).unwrap();
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     let job = store
-        .enqueue(Job::new_pending("email", vec![1]))
+        .enqueue(AcceptedJob::new("email", vec![1]))
         .await
         .unwrap();
     let claimed = store.claim_next("email").await.unwrap().unwrap();
@@ -379,7 +378,7 @@ async fn enqueue_is_not_starved_while_a_completion_batch_is_open() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     let enqueue = tokio::time::timeout(
         Duration::from_millis(150),
-        store.enqueue(Job::new_pending("email", vec![2])),
+        store.enqueue(AcceptedJob::new("email", vec![2])),
     )
     .await
     .expect("enqueue must finish after the completion batch wait, not hang forever")
@@ -387,7 +386,7 @@ async fn enqueue_is_not_starved_while_a_completion_batch_is_open() {
     assert_ne!(enqueue.id, job.id);
     assert_eq!(
         complete.await.unwrap().unwrap().unwrap().status,
-        JobStatus::Completed
+        ExecutionStatus::Completed
     );
 }
 
@@ -409,7 +408,7 @@ async fn claim_preempts_an_open_ingest_batch() {
 
     let enqueue = tokio::spawn({
         let store = store.clone();
-        async move { store.enqueue(Job::new_pending("email", vec![])).await }
+        async move { store.enqueue(AcceptedJob::new("email", vec![])).await }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
     let claimed = tokio::time::timeout(
@@ -420,7 +419,7 @@ async fn claim_preempts_an_open_ingest_batch() {
     .expect("claim must preempt ingest collection instead of waiting for the 500ms deadline")
     .unwrap()
     .unwrap();
-    assert_eq!(claimed.status, JobStatus::Running);
+    assert_eq!(claimed.status, ExecutionStatus::Running);
     enqueue.await.unwrap().unwrap();
 }
 
@@ -442,7 +441,7 @@ async fn claim_flushes_after_fair_ingest_budget() {
 
     let first = tokio::spawn({
         let store = store.clone();
-        async move { store.enqueue(Job::new_pending("email", vec![1])).await }
+        async move { store.enqueue(AcceptedJob::new("email", vec![1])).await }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -456,7 +455,7 @@ async fn claim_flushes_after_fair_ingest_budget() {
     for n in 2..=5 {
         let store = store.clone();
         follow_ups.push(tokio::spawn(async move {
-            store.enqueue(Job::new_pending("email", vec![n])).await
+            store.enqueue(AcceptedJob::new("email", vec![n])).await
         }));
     }
 
@@ -466,7 +465,7 @@ async fn claim_flushes_after_fair_ingest_budget() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(claimed.status, JobStatus::Running);
+    assert_eq!(claimed.status, ExecutionStatus::Running);
     first.await.unwrap().unwrap();
     for task in follow_ups {
         task.await.unwrap().unwrap();
@@ -497,7 +496,7 @@ async fn completion_batches_fill_under_mixed_ingest() {
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     for n in 0..8u8 {
         store
-            .enqueue(Job::new_pending("email", vec![n]))
+            .enqueue(AcceptedJob::new("email", vec![n]))
             .await
             .unwrap();
     }
@@ -515,14 +514,14 @@ async fn completion_batches_fill_under_mixed_ingest() {
                 .await
         }));
         tokio::spawn(async move {
-            let _ = enqueue_store.enqueue(Job::new_pending("email", vec![9])).await;
+            let _ = enqueue_store.enqueue(AcceptedJob::new("email", vec![9])).await;
         });
     }
 
     for task in completes {
         assert_eq!(
             task.await.unwrap().unwrap().unwrap().status,
-            JobStatus::Completed
+            ExecutionStatus::Completed
         );
     }
 }
@@ -551,7 +550,7 @@ async fn completes_progress_under_continuous_ingest() {
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     for n in 0..4u8 {
         store
-            .enqueue(Job::new_pending("email", vec![n]))
+            .enqueue(AcceptedJob::new("email", vec![n]))
             .await
             .unwrap();
     }
@@ -561,7 +560,7 @@ async fn completes_progress_under_continuous_ingest() {
         async move {
             for n in 0..64u8 {
                 store
-                    .enqueue(Job::new_pending("email", vec![n]))
+                    .enqueue(AcceptedJob::new("email", vec![n]))
                     .await
                     .unwrap();
             }
@@ -584,7 +583,7 @@ async fn completes_progress_under_continuous_ingest() {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(done.status, JobStatus::Completed);
+        assert_eq!(done.status, ExecutionStatus::Completed);
     }
     ingest.await.unwrap();
 }
@@ -615,7 +614,7 @@ async fn ingest_progresses_under_mixed_complete_traffic() {
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     for n in 0..8u8 {
         store
-            .enqueue(Job::new_pending("email", vec![n]))
+            .enqueue(AcceptedJob::new("email", vec![n]))
             .await
             .unwrap();
     }
@@ -636,7 +635,7 @@ async fn ingest_progresses_under_mixed_complete_traffic() {
     for n in 0..24u8 {
         let store = store.clone();
         enqueues.push(tokio::spawn(async move {
-            store.enqueue(Job::new_pending("email", vec![n])).await
+            store.enqueue(AcceptedJob::new("email", vec![n])).await
         }));
     }
 
@@ -674,7 +673,7 @@ async fn read_pool_serves_queries_while_an_enqueue_batch_is_open() {
     store.upsert_queue(JobQueue::new("email")).await.unwrap();
     let enqueue = tokio::spawn({
         let store = store.clone();
-        async move { store.enqueue(Job::new_pending("email", vec![])).await }
+        async move { store.enqueue(AcceptedJob::new("email", vec![])).await }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -700,7 +699,7 @@ async fn zero_retries_allows_exactly_one_execution() {
     queue.max_retries = 0;
     store.upsert_queue(queue).await.unwrap();
     let job = store
-        .enqueue(Job::new_pending("email", vec![]))
+        .enqueue(AcceptedJob::new("email", vec![]))
         .await
         .unwrap();
     let claimed = store.claim_next("email").await.unwrap().unwrap();
@@ -713,7 +712,7 @@ async fn zero_retries_allows_exactly_one_execution() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(done.status, JobStatus::Failed);
+    assert_eq!(done.status, ExecutionStatus::Failed);
     assert_eq!(done.execution_count, 1);
     assert!(store.claim_next("email").await.unwrap().is_none());
 }
@@ -726,7 +725,7 @@ async fn stale_leases_obey_retry_limit_without_incrementing_on_requeue() {
     queue.max_retries = 1;
     store.upsert_queue(queue).await.unwrap();
     let job = store
-        .enqueue(Job::new_pending("email", vec![]))
+        .enqueue(AcceptedJob::new("email", vec![]))
         .await
         .unwrap();
 
@@ -735,7 +734,7 @@ async fn stale_leases_obey_retry_limit_without_incrementing_on_requeue() {
         .recover_stale_leases(first.lease_expires_at.unwrap() + 1)
         .await
         .unwrap();
-    assert_eq!(recovered[0].status, JobStatus::Pending);
+    assert_eq!(recovered[0].status, ExecutionStatus::Pending);
     assert_eq!(recovered[0].execution_count, 1);
 
     let second = store.claim_next("email").await.unwrap().unwrap();
@@ -745,7 +744,7 @@ async fn stale_leases_obey_retry_limit_without_incrementing_on_requeue() {
         .recover_stale_leases(second.lease_expires_at.unwrap() + 1)
         .await
         .unwrap();
-    assert_eq!(recovered[0].status, JobStatus::Failed);
+    assert_eq!(recovered[0].status, ExecutionStatus::Failed);
     assert_eq!(recovered[0].execution_count, 2);
 }
 
@@ -755,7 +754,7 @@ async fn enqueue_rejects_unknown_queue() {
     let store = SqliteStore::open(&path).expect("open store");
 
     let error = store
-        .enqueue(Job::new_pending("missing", vec![]))
+        .enqueue(AcceptedJob::new("missing", vec![]))
         .await
         .expect_err("unknown queue should fail");
 
@@ -778,7 +777,7 @@ async fn concurrent_enqueues_are_durable_after_await() {
         let store = store.clone();
         handles.push(tokio::spawn(async move {
             store
-                .enqueue(Job::new_pending("email", format!("p{i}").into_bytes()))
+                .enqueue(AcceptedJob::new("email", format!("p{i}").into_bytes()))
                 .await
         }));
     }
@@ -791,7 +790,7 @@ async fn concurrent_enqueues_are_durable_after_await() {
 
     for id in ids {
         let job = store.get_job(id).await.expect("get job");
-        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.status, ExecutionStatus::Pending);
         assert_eq!(job.name, "email");
     }
 
@@ -810,11 +809,11 @@ async fn jobs_use_sequential_integer_ids_with_dispatch_indexes() {
             .await
             .expect("upsert queue");
         let first = store
-            .enqueue(Job::new_pending("email", vec![]))
+            .enqueue(AcceptedJob::new("email", vec![]))
             .await
             .expect("first enqueue");
         let second = store
-            .enqueue(Job::new_pending("email", vec![]))
+            .enqueue(AcceptedJob::new("email", vec![]))
             .await
             .expect("second enqueue");
         assert_eq!((first.id, second.id), (1, 2));
@@ -825,32 +824,32 @@ async fn jobs_use_sequential_integer_ids_with_dispatch_indexes() {
         .query_row(
             "SELECT group_concat(name, ',')
              FROM (SELECT name FROM sqlite_master
-                   WHERE type = 'index' AND tbl_name = 'jobs'
+                   WHERE type = 'index' AND tbl_name = 'accepted_jobs'
                    ORDER BY name)",
             [],
             |row| row.get::<_, Option<String>>(0),
         )
-        .expect("read job indexes")
-        .expect("dispatch indexes present");
-    assert_eq!(job_indexes, "idx_jobs_queue_pending");
+        .expect("read accepted_jobs indexes")
+        .expect("accepted_jobs indexes present");
+    assert_eq!(job_indexes, "idx_accepted_jobs_queue_available");
 
     let results_path = default_results_path(&path);
     let results = rusqlite::Connection::open(&results_path).expect("open results db");
-    let attempt_indexes: String = results
+    let execution_indexes: String = results
         .query_row(
             "SELECT group_concat(name, ',')
              FROM (SELECT name FROM sqlite_master
-                   WHERE type = 'index' AND tbl_name = 'job_attempts'
+                   WHERE type = 'index' AND tbl_name = 'executions'
                      AND name NOT LIKE 'sqlite_%'
                    ORDER BY name)",
             [],
             |row| row.get::<_, Option<String>>(0),
         )
-        .expect("read attempt indexes")
-        .expect("attempt indexes present");
+        .expect("read execution indexes")
+        .expect("execution indexes present");
     assert_eq!(
-        attempt_indexes,
-        "idx_attempts_job_id,idx_attempts_stale_leases"
+        execution_indexes,
+        "idx_executions_job_id,idx_executions_stale_leases"
     );
 
     cleanup_store(&path);
@@ -869,12 +868,12 @@ async fn mixed_unknown_queue_does_not_block_valid_enqueues() {
     let store_bad = store.clone();
     let ok = tokio::spawn(async move {
         store_ok
-            .enqueue(Job::new_pending("email", b"ok".to_vec()))
+            .enqueue(AcceptedJob::new("email", b"ok".to_vec()))
             .await
     });
     let bad = tokio::spawn(async move {
         store_bad
-            .enqueue(Job::new_pending("missing", b"no".to_vec()))
+            .enqueue(AcceptedJob::new("missing", b"no".to_vec()))
             .await
     });
 

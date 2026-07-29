@@ -120,7 +120,7 @@ mod tests {
 
     use axum::{body::Body, http::Request};
     use maqistor_dispatcher::{RegistryDispatcher, WorkerRegistry};
-    use maqistor_engine::{Job, JobQueue, JobStatus, StoreError};
+    use maqistor_engine::{AcceptedJob, Job, JobQueue, ExecutionStatus, StoreError};
     use tower::ServiceExt;
 
     use super::*;
@@ -145,13 +145,14 @@ mod tests {
         async fn list_queues(&self) -> Result<Vec<JobQueue>, StoreError> {
             Ok(self.queues.lock().unwrap().values().cloned().collect())
         }
-        async fn enqueue(&self, mut job: Job) -> Result<Job, StoreError> {
-            if self.queues.lock().unwrap().contains_key(&job.name) {
+        async fn enqueue(&self, mut job: AcceptedJob) -> Result<AcceptedJob, StoreError> {
+            if self.queues.lock().unwrap().contains_key(&job.queue_name) {
                 job.id = self.jobs.lock().unwrap().len() as i64 + 1;
-                self.jobs.lock().unwrap().insert(job.id, job.clone());
+                let view = Job::from_accepted(job.clone(), None);
+                self.jobs.lock().unwrap().insert(job.id, view);
                 Ok(job)
             } else {
-                Err(StoreError::QueueNotFound(job.name))
+                Err(StoreError::QueueNotFound(job.queue_name))
             }
         }
         async fn get_job(&self, id: i64) -> Result<Job, StoreError> {
@@ -162,7 +163,7 @@ mod tests {
                 .cloned()
                 .ok_or(StoreError::NotFound(id))
         }
-        async fn status(&self, id: i64) -> Result<JobStatus, StoreError> {
+        async fn status(&self, id: i64) -> Result<ExecutionStatus, StoreError> {
             Ok(self.get_job(id).await?.status)
         }
         async fn claim_next(&self, _queue: &str) -> Result<Option<Job>, StoreError> {

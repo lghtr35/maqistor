@@ -6,8 +6,16 @@
 # [persistence]
 # ingest_database = "./data/maqistor-ingest.db"
 # results_database = "./data/maqistor-results.db"  # default: swap -ingest → -results
-# durability = "balanced"      # "strict" prioritizes crash durability
+# durability = "balanced"      # "none" | "balanced" | "strict"
 # startup = "recover"          # "preserve" leaves stale leases untouched
+#
+# Optional: purge terminal jobs older than retention on a timer.
+# Durations use humantime strings, e.g.:
+#   30s, 5m, 1h30m, 2h15m30s, 1d, 7d, 1w, 1day 2h, 90minutes
+# [persistence.cleanup]
+# interval = "1h"
+# retention = "7d"
+#
 # [persistence.enqueue]
 # batch_size_min = 64
 # batch_size_max = 8192
@@ -28,7 +36,7 @@
 # Claim ask ceiling and concurrent dispatch writes.
 # Actual claim size is whatever free worker slots reserve returns.
 # [dispatch]
-# batch_size_max = 8192   # must be <= 16384
+# batch_size_max = 8192
 # max_in_flight = 1024
 
 [worker_tls]
@@ -36,8 +44,21 @@ ca_cert_path = "./certs/ca.pem"
 cert_path = "./certs/maqistor-cert.pem"
 key_path = "./certs/maqistor-key.pem"
 
+# External-only queue (workers connect themselves).
 [[queues]]
 name = "example"
-mode = "external"
 max_retries = 3
 timeout_secs = 60
+
+# Optional managed replicas for the same queue name (external workers may still attach).
+# [[queues]]
+# name = "email"
+# max_retries = 3
+# timeout_secs = 60
+#
+# [queues.managed_config]
+# image = "ghcr.io/example/email-worker:1.2.3"
+# replicas = 2
+# env_file = "./workers/email.env"
+# [queues.managed_config.env_vars]
+# MAQISTOR_WORKER_CONCURRENCY = "16"

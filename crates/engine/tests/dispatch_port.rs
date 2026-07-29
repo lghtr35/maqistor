@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+﻿use std::sync::{Arc, Mutex};
 
 use maqistor_engine::{
     DispatchError, DispatchPermit, Job, ReservedDispatch, WorkerDispatcher,
@@ -29,7 +29,19 @@ impl WorkerDispatcher for RecordingDispatcher {
 #[tokio::test]
 async fn fake_dispatcher_accepts_a_job() {
     let dispatcher = RecordingDispatcher::default();
-    let job = Job::new_pending("email", b"payload".to_vec());
+    let job = Job {
+        id: 0,
+        name: "email".into(),
+        status: maqistor_engine::ExecutionStatus::Pending,
+        payload: b"payload".to_vec(),
+        execution_count: 0,
+        lease_expires_at: None,
+        dispatch_id: None,
+        result_payload: None,
+        result_error: None,
+        created_at: 0,
+        updated_at: 0,
+    };
     let expected_id = job.id;
     let permit = ReservedDispatch::new("email".into(), Box::new(TestPermit));
 
