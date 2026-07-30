@@ -898,11 +898,12 @@ async fn run_complete_turn(
     };
     if let Some(commit) = conn.complete_batch(pending) {
         lane_controller.observe_success(ResultsLane::Completion, commit.count, commit.duration);
-        controller.record_successful_commit(
+        let completion_backlog = queues.complete.len() + rx.len();
+        controller.record_successful_completion_commit(
             filled.min(commit.count),
             commit.duration,
             Instant::now(),
-            rx.len(),
+            completion_backlog,
             reason,
         );
         debug!(
@@ -910,7 +911,7 @@ async fn run_complete_turn(
             filled,
             batch_size = controller.batch_size(),
             batch_wait_ms = controller.batch_wait.as_millis(),
-            backlog = rx.len(),
+            backlog = completion_backlog,
             "adaptive results batch updated"
         );
     }
@@ -946,7 +947,7 @@ fn flush_complete(
         let batch: Vec<_> = queues.complete.drain(..).collect();
         let filled = batch.len();
         if let Some(commit) = conn.complete_batch(batch) {
-            controller.record_successful_commit(
+            controller.record_successful_completion_commit(
                 filled.min(commit.count),
                 commit.duration,
                 Instant::now(),

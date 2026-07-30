@@ -1,4 +1,4 @@
-"""Shared oha and SQLite helpers for maqistor benchmarks."""
+"""Shared HTTP, SQLite, and lifecycle helpers for Maqistor benchmarks."""
 
 from __future__ import annotations
 
@@ -56,6 +56,42 @@ def open_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def seed_jobs(
+    db_path: Path, *, queue: str, payload: bytes, count: int
+) -> tuple[int, int, float, int]:
+    """Insert benchmark jobs in one SQLite transaction, outside drain timing."""
+    started = time.monotonic()
+    try:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+    except sqlite3.Error as err:
+        raise SystemExit(f"failed to open database {db_path} for benchmark seeding: {err}") from err
+    try:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("BEGIN IMMEDIATE")
+        queue_exists = conn.execute(
+            "SELECT 1 FROM job_queues WHERE name = ?1", (queue,)
+        ).fetchone()
+        if queue_exists is None:
+            raise SystemExit(f"queue not found in ingest database: {queue}")
+        now_ms = time.time_ns() // 1_000_000
+        conn.executemany(
+            """
+            INSERT INTO accepted_jobs(queue_name, payload, dispatch_id, created_at, updated_at)
+            VALUES (?1, ?2, NULL, ?3, ?3)
+            """,
+            ((queue, payload, now_ms) for _ in range(count)),
+        )
+        last_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+        committed_at_ms = time.time_ns() // 1_000_000
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return last_id - count + 1, last_id, time.monotonic() - started, committed_at_ms
+
+
 def max_job_id(ingest: sqlite3.Connection) -> int:
     row = ingest.execute(
         "SELECT COALESCE(MAX(id), 0) AS max_id FROM accepted_jobs"
@@ -68,21 +104,24 @@ def count_open(
     results: sqlite3.Connection,
     queue: str,
     after_id: int,
+    through_id: int | None = None,
 ) -> int:
     """Available ingest rows + running executions above the job watermark."""
     pending = ingest.execute(
         """
         SELECT COUNT(*) AS n FROM accepted_jobs
-        WHERE queue_name = ?1 AND id > ?2 AND dispatch_id IS NULL
+        WHERE queue_name = ?1 AND id > ?2 AND (?3 IS NULL OR id <= ?3)
+          AND dispatch_id IS NULL
         """,
-        (queue, after_id),
+        (queue, after_id, through_id),
     ).fetchone()
     running = results.execute(
         """
         SELECT COUNT(*) AS n FROM executions
-        WHERE queue_name = ?1 AND job_id > ?2 AND status = 'running'
+        WHERE queue_name = ?1 AND job_id > ?2 AND (?3 IS NULL OR job_id <= ?3)
+          AND status = 'running'
         """,
-        (queue, after_id),
+        (queue, after_id, through_id),
     ).fetchone()
     return int(pending["n"]) + int(running["n"])
 
@@ -93,12 +132,14 @@ def wait_drain(
     *,
     queue: str,
     after_id: int,
+    through_id: int | None = None,
     timeout_s: float,
     poll_s: float,
+    started_at: float | None = None,
 ) -> tuple[bool, float, int]:
     """Poll until no available ingest / running executions remain above after_id."""
-    started = time.monotonic()
-    remaining = count_open(ingest, results, queue, after_id)
+    started = time.monotonic() if started_at is None else started_at
+    remaining = count_open(ingest, results, queue, after_id, through_id)
     if remaining == 0:
         return True, 0.0, 0
     while True:
@@ -106,8 +147,46 @@ def wait_drain(
         if elapsed >= timeout_s:
             return False, elapsed, remaining
         time.sleep(poll_s)
-        remaining = count_open(ingest, results, queue, after_id)
+        remaining = count_open(ingest, results, queue, after_id, through_id)
         if remaining == 0:
+            return True, time.monotonic() - started, 0
+
+
+def wait_terminal(
+    results: sqlite3.Connection,
+    *,
+    queue: str,
+    after_id: int,
+    through_id: int,
+    expected: int,
+    timeout_s: float,
+    poll_s: float,
+    started_at: float | None = None,
+) -> tuple[bool, float, int]:
+    """Poll until every job in an exact ID range has a terminal execution."""
+    started = time.monotonic() if started_at is None else started_at
+
+    def remaining() -> int:
+        terminal = results.execute(
+            """
+            SELECT COUNT(*) AS n FROM executions
+            WHERE queue_name = ?1 AND job_id > ?2 AND job_id <= ?3
+              AND status IN ('completed', 'failed')
+            """,
+            (queue, after_id, through_id),
+        ).fetchone()
+        return max(0, expected - int(terminal["n"]))
+
+    outstanding = remaining()
+    if outstanding == 0:
+        return True, time.monotonic() - started, 0
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout_s:
+            return False, elapsed, outstanding
+        time.sleep(poll_s)
+        outstanding = remaining()
+        if outstanding == 0:
             return True, time.monotonic() - started, 0
 
 
@@ -130,14 +209,15 @@ def cycle_stats(
     results: sqlite3.Connection,
     queue: str,
     after_id: int,
+    through_id: int | None = None,
 ) -> dict:
     """Create→complete cycle ms: execution.updated_at - accepted_jobs.created_at."""
     jobs_in_window = ingest.execute(
         """
         SELECT COUNT(*) AS n FROM accepted_jobs
-        WHERE queue_name = ?1 AND id > ?2
+        WHERE queue_name = ?1 AND id > ?2 AND (?3 IS NULL OR id <= ?3)
         """,
-        (queue, after_id),
+        (queue, after_id, through_id),
     ).fetchone()
     jobs_in_window = int(jobs_in_window["n"])
 
@@ -145,19 +225,36 @@ def cycle_stats(
         """
         SELECT job_id, status, updated_at FROM executions
         WHERE queue_name = ?1 AND job_id > ?2
+          AND (?3 IS NULL OR job_id <= ?3)
           AND status IN ('completed', 'failed')
         """,
-        (queue, after_id),
+        (queue, after_id, through_id),
     ).fetchall()
+    first_claimed = ingest.execute(
+        """
+        SELECT MIN(updated_at) AS first_claimed_at_ms FROM accepted_jobs
+        WHERE queue_name = ?1 AND id > ?2 AND (?3 IS NULL OR id <= ?3)
+          AND dispatch_id IS NOT NULL
+        """,
+        (queue, after_id, through_id),
+    ).fetchone()
+    last_terminal = results.execute(
+        """
+        SELECT MAX(updated_at) AS last_terminal_at_ms FROM executions
+        WHERE queue_name = ?1 AND job_id > ?2 AND (?3 IS NULL OR job_id <= ?3)
+          AND status IN ('completed', 'failed')
+        """,
+        (queue, after_id, through_id),
+    ).fetchone()
 
     created = {
         int(row["id"]): int(row["created_at"])
         for row in ingest.execute(
             """
             SELECT id, created_at FROM accepted_jobs
-            WHERE queue_name = ?1 AND id > ?2
+            WHERE queue_name = ?1 AND id > ?2 AND (?3 IS NULL OR id <= ?3)
             """,
-            (queue, after_id),
+            (queue, after_id, through_id),
         ).fetchall()
     }
 
@@ -181,6 +278,8 @@ def cycle_stats(
         "cycle_p50_ms": _percentile(cycles, 50),
         "cycle_p99_ms": _percentile(cycles, 99),
         "cycle_max_ms": float(cycles[-1]) if cycles else None,
+        "first_claimed_at_ms": first_claimed["first_claimed_at_ms"],
+        "last_terminal_at_ms": last_terminal["last_terminal_at_ms"],
     }
 
 

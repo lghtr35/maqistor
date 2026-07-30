@@ -2,11 +2,14 @@ mod adaptive;
 mod types;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    time::{Duration, MissedTickBehavior},
+};
 
 pub use adaptive::{AdaptiveBatch, DirectionStreak, Ewma};
 pub use types::{
@@ -208,14 +211,18 @@ pub struct JobView {
 #[derive(Debug, Clone)]
 pub struct DispatchOptions {
     pub batch_size_max: usize,
-    pub max_in_flight: usize,
+    pub max_delivery_in_flight: usize,
+    pub idle_probe_interval: Duration,
+    pub idle_probe_batch_size: usize,
 }
 
 impl Default for DispatchOptions {
     fn default() -> Self {
         Self {
             batch_size_max: 8_192,
-            max_in_flight: 1_024,
+            max_delivery_in_flight: 8_192,
+            idle_probe_interval: Duration::from_secs(1),
+            idle_probe_batch_size: 64,
         }
     }
 }
@@ -227,8 +234,14 @@ impl DispatchOptions {
                 "dispatch.batch_size_max must be in 1..={MAX_CLAIM_BATCH_SIZE}"
             ));
         }
-        if self.max_in_flight == 0 {
-            return Err("dispatch.max_in_flight must be greater than zero".into());
+        if self.max_delivery_in_flight == 0 {
+            return Err("dispatch.max_delivery_in_flight must be greater than zero".into());
+        }
+        if self.idle_probe_interval.is_zero() {
+            return Err("dispatch.idle_probe_interval must be greater than zero".into());
+        }
+        if self.idle_probe_batch_size == 0 {
+            return Err("dispatch.idle_probe_batch_size must be greater than zero".into());
         }
         Ok(())
     }
@@ -245,8 +258,28 @@ struct Scheduler {
     tx: mpsc::UnboundedSender<String>,
     delivery_tx: mpsc::Sender<DeliveryWork>,
     delivery_budget: Arc<Semaphore>,
-    awake: Mutex<HashMap<String, bool>>,
+    state: Mutex<SchedulerState>,
     options: DispatchOptions,
+}
+
+#[derive(Default)]
+struct SchedulerState {
+    scheduled: HashMap<String, QueueSchedule>,
+    idle: VecDeque<String>,
+    idle_set: HashSet<String>,
+}
+
+#[derive(Default)]
+struct QueueSchedule {
+    rerun: bool,
+    retry_count: u8,
+}
+
+enum PassOutcome {
+    Active,
+    Idle,
+    CapacityBlocked,
+    Retry,
 }
 
 struct DeliveryWork {
@@ -263,15 +296,15 @@ impl<
     pub fn with_dispatcher(store: S, dispatcher: D, options: DispatchOptions) -> Self {
         options.validate().expect("invalid dispatch options");
         let (tx, rx) = mpsc::unbounded_channel();
-        let (delivery_tx, delivery_rx) = mpsc::channel(options.max_in_flight);
+        let (delivery_tx, delivery_rx) = mpsc::channel(options.max_delivery_in_flight);
         let engine = Self {
             store,
             dispatcher,
             scheduler: Arc::new(Scheduler {
                 tx,
                 delivery_tx,
-                delivery_budget: Arc::new(Semaphore::new(options.max_in_flight)),
-                awake: Mutex::new(HashMap::new()),
+                delivery_budget: Arc::new(Semaphore::new(options.max_delivery_in_flight)),
+                state: Mutex::new(SchedulerState::default()),
                 options,
             }),
         };
@@ -287,7 +320,7 @@ impl<
             .store
             .enqueue(AcceptedJob::new(job.name, payload))
             .await?;
-        self.ensure_awake(result.queue_name.clone()).await;
+        self.schedule_queue(result.queue_name.clone());
         Ok(JobView {
             id: result.id,
             name: result.queue_name,
@@ -326,7 +359,7 @@ impl<
                 match events.recv().await {
                     Ok(event) => match event {
                         WorkerEvent::Registered { queue_name } => {
-                            engine.ensure_awake(queue_name).await;
+                            engine.schedule_queue(queue_name);
                         }
                         WorkerEvent::Result { queue_name, result } => {
                             let completion_engine = engine.clone();
@@ -342,10 +375,10 @@ impl<
                                         .await,
                                     Ok(true)
                                 ) {
-                                    completion_engine.ensure_awake(completion_queue).await;
+                                    completion_engine.schedule_queue(completion_queue);
                                 }
                             });
-                            engine.ensure_awake(queue_name).await;
+                            engine.schedule_queue(queue_name);
                         }
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -355,24 +388,37 @@ impl<
         });
     }
 
-    async fn ensure_awake(&self, queue: String) {
-        let mut awake = self
-            .scheduler
-            .awake
-            .lock()
-            .expect("engine wake lock poisoned");
-        if let Some(rewake) = awake.get_mut(&queue) {
-            *rewake = true;
-            return;
+    fn schedule_queue(&self, queue: String) {
+        let should_send = {
+            let mut state = self
+                .scheduler
+                .state
+                .lock()
+                .expect("engine scheduler lock poisoned");
+            if let Some(schedule) = state.scheduled.get_mut(&queue) {
+                schedule.rerun = true;
+                false
+            } else {
+                state.idle_set.remove(&queue);
+                state
+                    .scheduled
+                    .insert(queue.clone(), QueueSchedule::default());
+                true
+            }
+        };
+        if should_send {
+            let _ = self.scheduler.tx.send(queue);
         }
-        awake.insert(queue.clone(), false);
-        let _ = self.scheduler.tx.send(queue);
     }
 
     fn start_scheduler(&self, mut rx: mpsc::UnboundedReceiver<String>) {
         let engine = self.clone();
         tokio::spawn(async move {
-            let mut recovery = tokio::time::interval(std::time::Duration::from_secs(30));
+            engine.seed_idle_queues().await;
+            let mut recovery = tokio::time::interval(Duration::from_secs(30));
+            let mut idle_probe =
+                tokio::time::interval(engine.scheduler.options.idle_probe_interval);
+            idle_probe.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     Some(queue) = rx.recv() => {
@@ -383,14 +429,56 @@ impl<
                     _ = recovery.tick() => {
                         let now = crate::unix_now();
                         if let Ok(recovered) = engine.store.recover_stale_leases(now).await {
-                            let queues = recovered.into_iter().filter(|job| job.status == ExecutionStatus::Pending).map(|job| job.name).collect();
-                            engine.wake_after_pass(queues);
+                            for queue in recovered.into_iter().filter(|job| job.status == ExecutionStatus::Pending).map(|job| job.name) {
+                                engine.schedule_queue(queue);
+                            }
                         }
                     }
+                    _ = idle_probe.tick() => engine.probe_idle_queues(),
                     else => break,
                 }
             }
         });
+    }
+
+    async fn seed_idle_queues(&self) {
+        let Ok(queues) = self.store.list_queues().await else {
+            return;
+        };
+        let mut state = self
+            .scheduler
+            .state
+            .lock()
+            .expect("engine scheduler lock poisoned");
+        for queue in queues {
+            if state.idle_set.insert(queue.name.clone()) {
+                state.idle.push_back(queue.name);
+            }
+        }
+    }
+
+    fn probe_idle_queues(&self) {
+        let queues = {
+            let mut state = self
+                .scheduler
+                .state
+                .lock()
+                .expect("engine scheduler lock poisoned");
+            let mut queues = Vec::with_capacity(self.scheduler.options.idle_probe_batch_size);
+            while queues.len() < self.scheduler.options.idle_probe_batch_size {
+                let Some(queue) = state.idle.pop_front() else {
+                    break;
+                };
+                state.idle_set.remove(&queue);
+                if !state.scheduled.contains_key(&queue) {
+                    queues.push(queue);
+                }
+            }
+            queues
+        };
+        for queue in queues {
+            self.schedule_queue(queue);
+        }
     }
 
     fn start_delivery_pump(&self, mut rx: mpsc::Receiver<DeliveryWork>) {
@@ -414,27 +502,38 @@ impl<
                         let _ = engine.store.release_claim(job.id, dispatch_id).await;
                     }
 
-                    engine.ensure_awake(queue_name).await;
+                    engine.schedule_queue(queue_name);
                 });
             }
         });
     }
 
     async fn drain_pass(&self, queues: HashSet<String>) {
-        let count = self
+        let batch_size_max = self
             .scheduler
             .options
             .batch_size_max
             .min(MAX_CLAIM_BATCH_SIZE);
+        let headroom = self.scheduler.delivery_budget.available_permits();
+        if headroom == 0 {
+            for queue in queues {
+                self.finish_pass(queue, PassOutcome::CapacityBlocked);
+            }
+            return;
+        }
+        let queue_count = queues.len().max(1);
+        let per_queue = (headroom / queue_count).max(1).min(batch_size_max);
         let requests: Vec<_> = queues
             .iter()
             .map(|queue_name| QueueReservation {
                 queue_name: queue_name.clone(),
-                count,
+                count: per_queue,
             })
             .collect();
         let Ok(permits) = self.dispatcher.reserve(requests).await else {
-            self.wake_after_pass(queues);
+            for queue in queues {
+                self.finish_pass(queue, PassOutcome::Retry);
+            }
             return;
         };
         let mut permits_by_queue: HashMap<String, Vec<(ReservedDispatch, OwnedSemaphorePermit)>> =
@@ -449,9 +548,9 @@ impl<
                 Err(_) => self.dispatcher.release(permit).await,
             }
         }
-        let mut capped = HashSet::new();
         for queue_name in &queues {
             let Some(permits) = permits_by_queue.remove(queue_name) else {
+                self.finish_pass(queue_name.clone(), PassOutcome::CapacityBlocked);
                 continue;
             };
             let reserved = permits.len();
@@ -459,11 +558,14 @@ impl<
                 for (permit, _budget) in permits {
                     self.dispatcher.release(permit).await;
                 }
+                self.finish_pass(queue_name.clone(), PassOutcome::Retry);
                 continue;
             };
-            if jobs.len() == reserved && reserved == count {
-                capped.insert(queue_name.clone());
-            }
+            let outcome = if jobs.len() == reserved {
+                PassOutcome::Active
+            } else {
+                PassOutcome::Idle
+            };
             let mut permits = permits.into_iter();
             for job in jobs {
                 let (permit, budget) = permits
@@ -483,36 +585,76 @@ impl<
                     if let Some(dispatch_id) = job.dispatch_id.as_deref() {
                         let _ = self.store.release_claim(job.id, dispatch_id).await;
                     }
-                    self.ensure_awake(job.name).await;
+                    self.schedule_queue(job.name);
                 }
             }
             for (permit, _budget) in permits {
                 self.dispatcher.release(permit).await;
             }
-        }
-        self.wake_after_pass(capped.clone());
-        for queue in queues.difference(&capped) {
-            let mut awake = self
-                .scheduler
-                .awake
-                .lock()
-                .expect("engine wake lock poisoned");
-            if awake.remove(queue).unwrap_or(false) {
-                let _ = self.scheduler.tx.send(queue.clone());
-            }
+            self.finish_pass(queue_name.clone(), outcome);
         }
     }
 
-    fn wake_after_pass(&self, queues: HashSet<String>) {
-        for queue in queues {
-            let mut awake = self
+    fn finish_pass(&self, queue: String, outcome: PassOutcome) {
+        let mut schedule_retry = None;
+        let should_send = {
+            let mut state = self
                 .scheduler
-                .awake
+                .state
                 .lock()
-                .expect("engine wake lock poisoned");
-            if let Some(rewake) = awake.get_mut(&queue) {
-                *rewake = false;
+                .expect("engine scheduler lock poisoned");
+            let Some(schedule) = state.scheduled.get_mut(&queue) else {
+                return;
+            };
+            match outcome {
+                PassOutcome::Active => {
+                    schedule.rerun = false;
+                    schedule.retry_count = 0;
+                    true
+                }
+                PassOutcome::Idle | PassOutcome::CapacityBlocked => {
+                    if schedule.rerun {
+                        schedule.rerun = false;
+                        schedule.retry_count = 0;
+                        true
+                    } else {
+                        state.scheduled.remove(&queue);
+                        if state.idle_set.insert(queue.clone()) {
+                            state.idle.push_back(queue.clone());
+                        }
+                        false
+                    }
+                }
+                PassOutcome::Retry => {
+                    schedule.rerun = false;
+                    schedule.retry_count = schedule.retry_count.saturating_add(1).min(7);
+                    let delay_ms = 10_u64.saturating_mul(1_u64 << schedule.retry_count);
+                    schedule_retry = Some(Duration::from_millis(delay_ms.min(1_000)));
+                    false
+                }
             }
+        };
+        if should_send {
+            let _ = self.scheduler.tx.send(queue);
+        } else if let Some(delay) = schedule_retry {
+            let engine = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                engine.resume_retry(queue);
+            });
+        }
+    }
+
+    fn resume_retry(&self, queue: String) {
+        let should_send = {
+            let state = self
+                .scheduler
+                .state
+                .lock()
+                .expect("engine scheduler lock poisoned");
+            state.scheduled.contains_key(&queue)
+        };
+        if should_send {
             let _ = self.scheduler.tx.send(queue);
         }
     }
@@ -529,6 +671,7 @@ mod tests {
     #[derive(Clone)]
     struct TestStore {
         pending: Arc<Mutex<VecDeque<Job>>>,
+        queues: Arc<Mutex<Vec<JobQueue>>>,
         claims: Arc<AtomicUsize>,
         releases: Arc<AtomicUsize>,
     }
@@ -544,9 +687,16 @@ mod tests {
                 .collect();
             Self {
                 pending: Arc::new(Mutex::new(pending)),
+                queues: Arc::new(Mutex::new(Vec::new())),
                 claims: Arc::new(AtomicUsize::new(0)),
                 releases: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn with_pending_known_queue(count: i64) -> Self {
+            let store = Self::with_pending(count);
+            store.queues.lock().unwrap().push(JobQueue::new("email"));
+            store
         }
     }
 
@@ -560,7 +710,7 @@ mod tests {
         }
 
         async fn list_queues(&self) -> Result<Vec<JobQueue>, StoreError> {
-            Ok(Vec::new())
+            Ok(self.queues.lock().unwrap().clone())
         }
 
         async fn enqueue(&self, job: AcceptedJob) -> Result<AcceptedJob, StoreError> {
@@ -689,10 +839,11 @@ mod tests {
         .expect("background task should make progress");
     }
 
-    fn test_options(max_in_flight: usize) -> DispatchOptions {
+    fn test_options(max_delivery_in_flight: usize) -> DispatchOptions {
         DispatchOptions {
             batch_size_max: 1,
-            max_in_flight,
+            max_delivery_in_flight,
+            ..DispatchOptions::default()
         }
     }
 
@@ -703,6 +854,49 @@ mod tests {
             ..DispatchOptions::default()
         };
         assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn dispatch_options_reject_zero_idle_probe_limits() {
+        let interval = DispatchOptions {
+            idle_probe_interval: Duration::ZERO,
+            ..DispatchOptions::default()
+        };
+        assert!(interval.validate().is_err());
+        let batch = DispatchOptions {
+            idle_probe_batch_size: 0,
+            ..DispatchOptions::default()
+        };
+        assert!(batch.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn schedule_requests_coalesce_to_one_rerun() {
+        let store = TestStore::with_pending(0);
+        let dispatcher = TestDispatcher::blocking();
+        let engine = Engine::with_dispatcher(store, dispatcher, test_options(1));
+
+        engine.schedule_queue("email".into());
+        engine.schedule_queue("email".into());
+        engine.schedule_queue("email".into());
+
+        let state = engine.scheduler.state.lock().unwrap();
+        let schedule = state.scheduled.get("email").expect("queue scheduled");
+        assert!(schedule.rerun);
+        assert_eq!(state.scheduled.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_probe_discovers_pending_work_without_a_submit_event() {
+        let store = TestStore::with_pending_known_queue(1);
+        let dispatcher = TestDispatcher::blocking();
+        let mut options = test_options(1);
+        options.idle_probe_interval = Duration::from_millis(1);
+        let _engine = Engine::with_dispatcher(store.clone(), dispatcher.clone(), options);
+
+        wait_for(&store.claims, 1).await;
+        wait_for(&dispatcher.dispatches, 1).await;
+        dispatcher.unblock.notify_one();
     }
 
     #[tokio::test]
@@ -724,7 +918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_budget_bounds_claims_across_scheduler_passes() {
+    async fn delivery_headroom_prevents_excess_reservations() {
         let store = TestStore::with_pending(2);
         let dispatcher = TestDispatcher::blocking();
         let engine = Engine::with_dispatcher(store.clone(), dispatcher.clone(), test_options(1));
@@ -735,7 +929,7 @@ mod tests {
         engine.drain_pass(queues).await;
 
         assert_eq!(store.claims.load(Ordering::SeqCst), 1);
-        assert!(dispatcher.releases.load(Ordering::SeqCst) >= 1);
+        assert_eq!(dispatcher.releases.load(Ordering::SeqCst), 0);
         dispatcher.unblock.notify_one();
     }
 

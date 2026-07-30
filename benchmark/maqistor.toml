@@ -26,8 +26,8 @@ batch_probe_factor = 1.50
 batch_backoff_factor = 0.80
 
 [persistence.completion]
-batch_size_min = 512
-batch_size_max = 8192   
+batch_size_min = 1024
+batch_size_max = 65536
 batch_wait_min_ms = 1
 batch_wait_max_ms = 2
 ewma_window = 4
@@ -36,7 +36,9 @@ batch_backoff_factor = 0.80
 
 [dispatch]
 batch_size_max = 65536
-max_in_flight = 2048
+max_delivery_in_flight = 32768
+idle_probe_interval_ms = 1000
+idle_probe_batch_size = 64
 
 [[queues]]
 name = "bench"
@@ -45,6 +47,6 @@ timeout_secs = 60
 
 [queues.managed_config]
 image = "maqistor-benchmark-noop-worker:0.1.0"
-replicas = 16
+replicas = 4
 [queues.managed_config.env_vars]
-MAQISTOR_WORKER_CONCURRENCY = "256"
+MAQISTOR_WORKER_CONCURRENCY = "8192"

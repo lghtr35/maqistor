@@ -182,14 +182,26 @@ impl PersistenceConfig {
 #[serde(deny_unknown_fields)]
 pub struct DispatchConfig {
     pub batch_size_max: Option<usize>,
-    pub max_in_flight: Option<usize>,
+    #[serde(alias = "max_in_flight")]
+    pub max_delivery_in_flight: Option<usize>,
+    pub idle_probe_interval_ms: Option<u64>,
+    pub idle_probe_batch_size: Option<usize>,
 }
 
 impl DispatchConfig {
     pub fn options(&self) -> anyhow::Result<DispatchOptions> {
         let mut options = DispatchOptions::default();
         options.batch_size_max = self.batch_size_max.unwrap_or(options.batch_size_max);
-        options.max_in_flight = self.max_in_flight.unwrap_or(options.max_in_flight);
+        options.max_delivery_in_flight = self
+            .max_delivery_in_flight
+            .unwrap_or(options.max_delivery_in_flight);
+        options.idle_probe_interval = Duration::from_millis(
+            self.idle_probe_interval_ms
+                .unwrap_or(options.idle_probe_interval.as_millis() as u64),
+        );
+        options.idle_probe_batch_size = self
+            .idle_probe_batch_size
+            .unwrap_or(options.idle_probe_batch_size);
         options.validate().map_err(anyhow::Error::msg)?;
         Ok(options)
     }
@@ -386,7 +398,7 @@ mod tests {
 
     #[test]
     fn custom_limits_and_window_are_applied() {
-        let config: AppConfig = toml::from_str(&format!("{TLS}[persistence.enqueue]\newma_window = 8\nbatch_size_min = 4\nbatch_size_max = 32\nbatch_wait_min_ms = 2\nbatch_wait_max_ms = 20\nbatch_probe_factor = 1.2\nbatch_backoff_factor = 0.7\n[persistence.completion]\nbatch_wait_max_ms = 10\n[dispatch]\nbatch_size_max = 2048\nmax_in_flight = 64\n"))
+        let config: AppConfig = toml::from_str(&format!("{TLS}[persistence.enqueue]\newma_window = 8\nbatch_size_min = 4\nbatch_size_max = 32\nbatch_wait_min_ms = 2\nbatch_wait_max_ms = 20\nbatch_probe_factor = 1.2\nbatch_backoff_factor = 0.7\n[persistence.completion]\nbatch_wait_max_ms = 10\n[dispatch]\nbatch_size_max = 2048\nmax_delivery_in_flight = 64\nidle_probe_interval_ms = 250\nidle_probe_batch_size = 12\n"))
         .expect("parse");
         let options = config.persistence.write_options().expect("options");
         assert_eq!(options.enqueue.ewma_window, 8);
@@ -397,6 +409,17 @@ mod tests {
         assert_eq!(options.enqueue.batch_probe_factor, 1.2);
         assert_eq!(options.completion.batch_wait_max, Duration::from_millis(10));
         assert_eq!(config.dispatch.options().unwrap().batch_size_max, 2048);
+        assert_eq!(
+            config.dispatch.options().unwrap().idle_probe_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(config.dispatch.options().unwrap().idle_probe_batch_size, 12);
+
+        let legacy: AppConfig = toml::from_str(&format!(
+            "{TLS}[dispatch]\nmax_in_flight = 32\n"
+        ))
+        .expect("parse legacy limit");
+        assert_eq!(legacy.dispatch.options().unwrap().max_delivery_in_flight, 32);
     }
 
     #[test]
@@ -416,6 +439,12 @@ mod tests {
         ))
         .expect("parse");
         assert!(invalid_adaptation.validate().is_err());
+
+        let zero_probe: AppConfig = toml::from_str(&format!(
+            "{TLS}[dispatch]\nidle_probe_interval_ms = 0\nidle_probe_batch_size = 0\n"
+        ))
+        .expect("parse");
+        assert!(zero_probe.dispatch.options().is_err());
     }
 
     #[test]

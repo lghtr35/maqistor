@@ -15,6 +15,8 @@ const MAX_QUEUEING_RATIO: f64 = 1.20;
 const TARGET_FILL_RATIO: f64 = 0.75;
 const BASELINE_RELAXATION: f64 = 0.02;
 const LOW_FILL_RATIO: f64 = 0.50;
+const COMPLETION_GOODPUT_REGRESSION: f64 = 0.95;
+const COMPLETION_GOODPUT_RELAXATION: f64 = 0.10;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FlushReason {
@@ -203,6 +205,8 @@ pub(crate) struct AdaptiveBatchController {
     last_request: Option<Instant>,
     last_commit: Option<Instant>,
     wait_direction_streak: DirectionStreak,
+    completion_goodput: Ewma,
+    completion_goodput_baseline: Option<f64>,
 }
 
 impl AdaptiveBatchController {
@@ -227,6 +231,8 @@ impl AdaptiveBatchController {
             last_request: None,
             last_commit: None,
             wait_direction_streak: DirectionStreak::default(),
+            completion_goodput: Ewma::new(options.ewma_window),
+            completion_goodput_baseline: None,
         }
     }
 
@@ -270,6 +276,35 @@ impl AdaptiveBatchController {
         self.adjust_batch_wait();
     }
 
+    pub(crate) fn record_successful_completion_commit(
+        &mut self,
+        filled: usize,
+        elapsed: Duration,
+        completed_at: Instant,
+        backlog: usize,
+        reason: FlushReason,
+    ) {
+        self.backlog = backlog;
+        let interval = self
+            .last_commit
+            .replace(completed_at)
+            .map(|previous| completed_at.saturating_duration_since(previous))
+            .unwrap_or(elapsed);
+        let seconds = interval.as_secs_f64();
+        if seconds > 0.0 {
+            self.completion_goodput.observe(filled as f64 / seconds);
+        }
+        let fill_ratio = filled as f64 / self.batch.size().max(1) as f64;
+        self.fill_ratio.observe(fill_ratio);
+        if matches!(reason, FlushReason::Timeout) && backlog == 0 && fill_ratio < LOW_FILL_RATIO {
+            self.low_fill_timeouts = self.low_fill_timeouts.saturating_add(1);
+        } else {
+            self.low_fill_timeouts = 0;
+        }
+        self.adjust_completion_batch_size();
+        self.adjust_batch_wait();
+    }
+
     fn observe_commit_baseline(&mut self, sample: f64) {
         self.baseline_commit_duration = Some(match self.baseline_commit_duration {
             None => sample,
@@ -310,6 +345,41 @@ impl AdaptiveBatchController {
             0
         };
         self.batch.observe_direction(direction);
+    }
+
+    fn adjust_completion_batch_size(&mut self) {
+        let Some(goodput) = self.completion_goodput.value() else {
+            return;
+        };
+        if self.low_fill_timeouts >= LOW_FILL_TIMEOUTS && self.backlog == 0 {
+            self.batch.set_size(
+                (self.batch.size() as f64 * self.limits.batch_backoff_factor).floor() as usize,
+            );
+            self.low_fill_timeouts = 0;
+            self.batch.reset_direction();
+            self.completion_goodput_baseline = Some(goodput);
+            return;
+        }
+        if self.backlog == 0 {
+            self.completion_goodput_baseline = Some(goodput);
+            self.batch.observe_direction(0);
+            return;
+        }
+
+        let baseline = self.completion_goodput_baseline.unwrap_or(goodput);
+        let direction = if goodput < baseline * COMPLETION_GOODPUT_REGRESSION {
+            -1
+        } else {
+            1
+        };
+        let changed = self.batch.observe_direction(direction);
+        self.completion_goodput_baseline = Some(if direction > 0 {
+            baseline + (goodput - baseline) * COMPLETION_GOODPUT_RELAXATION
+        } else if changed {
+            goodput
+        } else {
+            baseline
+        });
     }
 
     pub(crate) fn adjust_batch_wait(&mut self) {
@@ -472,5 +542,62 @@ mod results_lane_tests {
             selected(controller.select(10, Some(now), 1, Some(now), now)),
             Some(ResultsLane::Completion)
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_batch_tests {
+    use super::*;
+
+    fn options() -> BatchOptions {
+        BatchOptions {
+            batch_size_min: 4,
+            batch_size_max: 16,
+            batch_wait_min: Duration::from_millis(1),
+            batch_wait_max: Duration::from_millis(2),
+            ewma_window: 1,
+            batch_probe_factor: 2.0,
+            batch_backoff_factor: 0.5,
+        }
+    }
+
+    #[test]
+    fn full_completion_backlog_probes_on_goodput_not_commit_duration() {
+        let mut controller = AdaptiveBatchController::new(&options());
+        let now = Instant::now();
+        for offset_ms in [10_u64, 20, 30] {
+            controller.record_successful_completion_commit(
+                4,
+                Duration::from_millis(50),
+                now + Duration::from_millis(offset_ms),
+                100,
+                FlushReason::FullBatch,
+            );
+        }
+        assert_eq!(controller.batch_size(), 16);
+    }
+
+    #[test]
+    fn sustained_completion_goodput_regression_backs_off_once() {
+        let mut controller = AdaptiveBatchController::new(&options());
+        controller.set_batch_size(8);
+        let now = Instant::now();
+        controller.record_successful_completion_commit(
+            8,
+            Duration::from_millis(10),
+            now,
+            100,
+            FlushReason::FullBatch,
+        );
+        for offset_ms in [100_u64, 200, 300] {
+            controller.record_successful_completion_commit(
+                8,
+                Duration::from_millis(10),
+                now + Duration::from_millis(offset_ms),
+                100,
+                FlushReason::FullBatch,
+            );
+        }
+        assert_eq!(controller.batch_size(), 4);
     }
 }
