@@ -91,7 +91,10 @@ enum ResultsRequest {
     CleanupExpiredRecords {
         cutoff: i64,
         reply: oneshot::Sender<Result<usize, StoreError>>,
-    }
+    },
+    Vacuum {
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
 }
 
 struct PendingCompletion {
@@ -514,6 +517,12 @@ impl ResultsConn {
         Ok(rows_affected)
     }
 
+    fn vacuum(&mut self) -> Result<(), StoreError> {
+        self.conn.execute_batch("VACUUM;")
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        Ok(())
+    }
+
     fn handle(&mut self, request: ResultsRequest) {
         match request {
             ResultsRequest::UpsertQueue { queue, reply } => {
@@ -548,6 +557,9 @@ impl ResultsConn {
             }
             ResultsRequest::CleanupExpiredRecords { cutoff, reply } => {
                 let _ = reply.send(self.cleanup_expired_records(cutoff));
+            }
+            ResultsRequest::Vacuum { reply } => {
+                let _ = reply.send(self.vacuum());
             }
         }
     }
@@ -677,6 +689,11 @@ impl ResultsHandle {
         self.call(|reply| ResultsRequest::CleanupExpiredRecords { cutoff, reply })
             .await
     }
+
+    pub(crate) async fn vacuum(&self) -> Result<(), StoreError> {
+        self.call(|reply| ResultsRequest::Vacuum { reply })
+            .await
+    }
 }
 
 struct ResultsQueues {
@@ -712,7 +729,8 @@ impl ResultsQueues {
             ResultsRequest::UpsertQueue { .. }
             | ResultsRequest::Abandon { .. }
             | ResultsRequest::RecoverStale { .. }
-            | ResultsRequest::CleanupExpiredRecords { .. } => self.meta.push_back(request),
+            | ResultsRequest::CleanupExpiredRecords { .. }
+            | ResultsRequest::Vacuum { .. } => self.meta.push_back(request),
         }
     }
 

@@ -12,6 +12,10 @@ durability = "balanced"
 ingest_database = "./benchmark/data/maqistor-ingest.db"
 results_database = "./benchmark/data/maqistor-results.db"
 
+[persistence.cleanup]
+interval = "2h"
+retention = "1d"
+
 [persistence.enqueue]
 batch_size_min = 512
 batch_size_max = 8192 
@@ -36,7 +40,6 @@ max_in_flight = 2048
 
 [[queues]]
 name = "bench"
-mode = "managed"
 max_retries = 0
 timeout_secs = 60
 
@@ -44,4 +47,4 @@ timeout_secs = 60
 image = "maqistor-benchmark-noop-worker:0.1.0"
 replicas = 16
 [queues.managed_config.env_vars]
-MAQISTOR_WORKER_CONCURRENCY = "128"
+MAQISTOR_WORKER_CONCURRENCY = "256"

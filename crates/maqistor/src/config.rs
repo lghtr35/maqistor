@@ -4,6 +4,7 @@ use maqistor_engine::DispatchOptions;
 use maqistor_persistence::{BatchOptions, DurabilityMode, SqliteWriteOptions, default_results_path};
 use serde::Deserialize;
 use humantime::parse_duration;
+use chrono::{Utc, NaiveTime, DateTime, FixedOffset};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:7828";
 const DEFAULT_WORKER_LISTEN: &str = "0.0.0.0:7829";
@@ -45,7 +46,8 @@ pub struct PersistenceConfig {
 #[serde(deny_unknown_fields)]
 pub struct CleanupConfig {
     interval: String,
-    retention: String,
+    retention: String, 
+    vacuum: Option<VacuumConfig>,
 }
 
 impl CleanupConfig {
@@ -57,6 +59,56 @@ impl CleanupConfig {
     pub fn retention(&self) -> anyhow::Result<Duration> {
         parse_duration(&self.retention)
             .map_err(|err| anyhow::anyhow!("invalid cleanup.retention {:?}: {err}", self.retention))
+    }
+
+    pub fn vacuum(&self) -> Option<VacuumConfig> {
+        if let Some(vacuum) = &self.vacuum {
+            Some(vacuum.clone())
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VacuumConfig {
+    every: String,
+    at: String,
+}
+
+impl VacuumConfig {
+    pub fn is_due(&self, last_run: Option<i64>) -> anyhow::Result<bool> {
+        let now = Utc::now();
+        let at = self.at()?;
+        let every = self.every()?;
+
+        let spacing_ok = match last_run {
+            None => true,
+            Some(last) => {
+                let every_ms = i64::try_from(every.as_millis())
+                    .map_err(|_| anyhow::anyhow!("vacuum.every too large"))?;
+                last.saturating_add(every_ms) <= now.timestamp_millis()
+            }
+        };
+        let at_ok = now.time() >= at;
+        Ok(spacing_ok && at_ok)
+    }
+
+    fn every(&self) -> anyhow::Result<Duration> {
+        parse_duration(&self.every)
+            .map_err(|err| anyhow::anyhow!("invalid vacuum.every {:?}: {err}", self.every))
+    }
+
+    fn at(&self) -> anyhow::Result<NaiveTime> {
+        let stamped = if self.at.contains('+') || self.at.rfind('-').is_some_and(|i| i > 0) {
+            let normalized = self.at.trim().replacen(' ', "", 1);
+            format!("1970-01-01T{normalized}:00")
+        } else {
+            format!("1970-01-01T{}:00+00:00", self.at.trim())
+        };
+        let when: DateTime<FixedOffset> = stamped.parse()?;
+        Ok(when.with_timezone(&Utc).time())
     }
 }
 

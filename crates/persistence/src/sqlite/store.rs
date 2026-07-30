@@ -125,6 +125,17 @@ impl SqliteStore {
         deleted += self.results.cleanup_expired_records(cutoff).await?;
         Ok(deleted)
     }
+
+    pub async fn last_vacuum_run(&self) -> Result<Option<i64>, StoreError> {
+        let meta = self.ingest.meta("last_vacuum_run").await?;
+        Ok(meta.map(|meta| meta.value.parse::<i64>().unwrap()))
+    }
+
+    pub async fn vacuum(&self) -> Result<(), StoreError> {
+        self.results.vacuum().await?;
+        self.ingest.vacuum().await?;
+        Ok(())
+    }
 }
 
 impl DurableStore for SqliteStore {

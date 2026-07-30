@@ -111,7 +111,14 @@ impl RwConnection {
 
 pub(crate) fn apply_acceptance_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(
-        "CREATE TABLE job_queues (
+        "CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX idx_meta_key ON meta(key);
+
+        CREATE TABLE job_queues (
             name TEXT PRIMARY KEY,
             max_retries INTEGER NOT NULL,
             timeout_secs INTEGER NOT NULL,
@@ -266,6 +273,19 @@ pub(crate) fn row_to_execution_with_queue_config(
     Ok(ExecutionWithQueueConfig {
         execution: row_to_execution_at(row, 0)?,
         queue: row_to_queue_at(row, 11)?,
+    })
+}
+
+pub(crate) struct Meta {
+    #[allow(dead_code)]
+    pub(crate) key: String,
+    pub(crate) value: String,
+}
+
+pub(crate) fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meta> {
+    Ok(Meta {
+        key: row.get(0)?,
+        value: row.get(1)?,
     })
 }
 
@@ -436,6 +456,27 @@ impl ReadPool {
             stmt.query_map([], row_to_queue)
                 .map_err(|err| StoreError::Internal(err.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| StoreError::Internal(err.to_string()))
+        })
+        .await
+        .map_err(|err| StoreError::Internal(err.to_string()))?
+    }
+
+    pub(crate) async fn meta(&self, key: &str) -> Result<Option<Meta>, StoreError> {
+        let connections = self.connections.clone();
+        let sql = "SELECT key, value FROM meta WHERE key = ?1";
+        let key = key.to_owned();
+        let index = self.connection()?;
+        tokio::task::spawn_blocking(move || {
+            let conn = connections[index]
+                .lock()
+                .map_err(|_| StoreError::Internal("read connection poisoned".into()))?;
+            let mut statement = conn
+                .prepare(sql)
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            statement
+                .query_row(params![key], row_to_meta)
+                .optional()
                 .map_err(|err| StoreError::Internal(err.to_string()))
         })
         .await

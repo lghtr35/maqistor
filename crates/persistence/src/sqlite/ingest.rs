@@ -15,7 +15,7 @@ use maqistor_engine::{AcceptedJob, JobQueue, MAX_CLAIM_BATCH_SIZE, StoreError};
 use super::adaptive::{AdaptiveBatchController, FlushReason};
 use super::bulk::{self, ROWS_PER_STATEMENT};
 use super::common::{
-    ReadPool, RwConnection, apply_acceptance_schema, new_dispatch_id, row_to_queue, unix_now,
+    Meta, ReadPool, RwConnection, apply_acceptance_schema, new_dispatch_id, row_to_queue, unix_now,
 };
 use super::options::{DurabilityMode, SqliteWriteOptions};
 
@@ -60,6 +60,9 @@ enum IngestRequest {
     CleanupExpiredRecords {
         cutoff: i64,
         reply: oneshot::Sender<Result<usize, StoreError>>,
+    },
+    Vacuum {
+        reply: oneshot::Sender<Result<(), StoreError>>,
     },
 }
 
@@ -332,6 +335,21 @@ impl IngestConn {
         Ok(rows_affected)
     }
 
+    fn vacuum(&mut self) -> Result<(), StoreError> {
+        self.conn
+            .execute_batch("VACUUM;")
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        let now = unix_now();
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('last_vacuum_run', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![now.to_string()],
+            )
+            .map_err(|err| StoreError::Internal(err.to_string()))?;
+        Ok(())
+    }
+
     fn handle(&mut self, request: IngestRequest, queue_names: &mut HashSet<String>) {
         match request {
             IngestRequest::UpsertQueue { queue, reply } => {
@@ -361,6 +379,9 @@ impl IngestConn {
             }
             IngestRequest::CleanupExpiredRecords { cutoff, reply } => {
                 let _ = reply.send(self.cleanup_expired_records(cutoff));
+            }
+            IngestRequest::Vacuum { reply } => {
+                let _ = reply.send(self.vacuum());
             }
         }
     }
@@ -475,6 +496,15 @@ impl IngestHandle {
         self.call(|reply| IngestRequest::CleanupExpiredRecords { cutoff, reply })
             .await
     }
+
+    pub(crate) async fn meta(&self, key: &str) -> Result<Option<Meta>, StoreError> {
+        self.reads.meta(key).await
+    }
+
+    pub(crate) async fn vacuum(&self) -> Result<(), StoreError> {
+        self.call(|reply| IngestRequest::Vacuum { reply })
+            .await
+    }
 }
 
 struct IngestQueues {
@@ -494,7 +524,8 @@ impl IngestQueues {
                 self.ingest.push_back(PendingEnqueue { job, reply });
             }
             IngestRequest::ClaimBatch { .. } => self.claim.push_back(request),
-            IngestRequest::UpsertQueue { .. } | IngestRequest::Repend { .. } | IngestRequest::CleanupExpiredRecords { .. } => {
+            IngestRequest::UpsertQueue { .. } | IngestRequest::Repend { .. } | 
+            IngestRequest::CleanupExpiredRecords { .. } | IngestRequest::Vacuum { .. } => {
                 self.meta.push_back(request);
             }
         }

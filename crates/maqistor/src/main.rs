@@ -9,7 +9,6 @@ use maqistor_persistence::SqliteStore;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 use std::time::{SystemTime, UNIX_EPOCH};
-
 use config::{CleanupConfig, StartupPolicy};
 
 mod config;
@@ -115,11 +114,26 @@ async fn main() -> anyhow::Result<()> {
 fn start_cleanup_task(store: &SqliteStore, config: &CleanupConfig) -> anyhow::Result<()> {
     let interval = config.interval()?;
     let retention = config.retention()?;
+    let vacuum = config.vacuum();
     let store = store.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
             cleanup_task(&store, retention).await;
+            if let Some(ref vacuum) = vacuum {
+                match store.last_vacuum_run().await {
+                    Ok(last_run) => match vacuum.is_due(last_run) {
+                        Ok(true) => {
+                            if let Err(err) = store.vacuum().await {
+                                error!("vacuum: {err}");
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(err) => error!("vacuum schedule: {err}"),
+                    },
+                    Err(err) => error!("last_vacuum_run: {err}"),
+                }
+            }
         }
     });
     Ok(())
