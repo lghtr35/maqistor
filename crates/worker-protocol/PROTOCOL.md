@@ -32,3 +32,9 @@ Results with an unknown or stale `dispatch_id` may be ignored by the server. Wor
 ## Compatibility
 
 The version is part of every frame. Any incompatible change requires a new CDDL file and a new `protocol_version`; version 1 implementations must continue to reject unknown versions.
+
+## Reading graph
+
+- [README.md](README.md) - protocol entry point and links to related crates.
+- [Dispatcher](../dispatcher/README.md) - server-side connection and capacity behavior.
+- [Rust worker SDK](../worker-sdk/README.md) - reference protocol implementation.

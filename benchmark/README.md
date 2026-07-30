@@ -6,6 +6,9 @@ the server and removes that directory. It refuses to run if another Maqistor
 process is already listening on the benchmark port, and waits for every managed
 worker configured in `benchmark/maqistor.toml` to register before testing.
 
+For server setup and the component reading graph, start with the
+[top-level README](../README.md).
+
 HTTP driver: **[oha](https://github.com/hatoo/oha)** (orchestrated by
 `benchmark/run.py`). Drain mode seeds SQLite directly; helpers live in
 `benchmark/benchmark_util.py`.

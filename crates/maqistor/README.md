@@ -1,16 +1,40 @@
 # maqistor
 
-The executable composition root for the Maqistor application.
+The `maqistor` binary is the composition root. It loads TOML configuration,
+opens durable storage, registers queues, starts the worker listener and managed
+worker supervisor, then serves the HTTP API.
 
-## Contains
+## Startup
 
-- CLI, configuration loading, logging, and startup wiring.
-- Construction of the API, Engine, Persistence, and Dispatcher adapters.
+1. Initialize `tracing` from `RUST_LOG` (default level: `info`).
+2. Load and validate configuration with unknown fields rejected.
+3. Open the ingest and results SQLite databases and upsert configured queues.
+4. Recover stale leases unless `persistence.startup = "preserve"`.
+5. Start the mutual-TLS worker listener and Docker supervisor. The supervisor
+   reconciles queues with `managed_config`, but Docker must be available at
+   process startup even when no queue uses it.
+6. Build the [Engine](../engine/README.md), subscribe to worker results, and
+   bind the [HTTP API](../api/README.md).
 
-## Does not contain
+## Configuration
 
-- Job lifecycle, scheduling, transport, Docker, or storage policy.
+[`../../maqistor.example.toml`](../../maqistor.example.toml) is the complete
+annotated template. Important sections are:
 
-## Internal dependencies
+| Section | Purpose |
+| --- | --- |
+| `worker_tls` | Required CA, server certificate, and server private-key paths for worker mTLS |
+| `persistence` | Ingest/results database paths, durability, startup recovery, cleanup, and writer batching |
+| `dispatch` | Claim-batch, delivery-budget, and idle-probe limits |
+| `queues` | Queue retry/timeout policy; optional `managed_config` provides Docker image, replicas, and environment |
 
-`maqistor-api`, `maqistor-engine`, `maqistor-persistence`, and `maqistor-dispatcher`.
+Workers may always connect independently to a configured queue. `managed_config`
+adds Docker-maintained workers; it does not change the worker protocol.
+
+## Reading graph
+
+- [Top-level README](../../README.md) - install and deployment boundary.
+- [api](../api/README.md) - HTTP routes exposed by this binary.
+- [engine](../engine/README.md) - lifecycle and scheduling policy.
+- [persistence](../persistence/README.md) - paired SQLite stores.
+- [dispatcher](../dispatcher/README.md) - mTLS connections and managed workers.
