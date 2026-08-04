@@ -35,6 +35,7 @@ pub enum WorkerMessage {
         job_id: i64,
         dispatch_id: String,
         execution_count: u32,
+        #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
     },
     JobResult {
@@ -61,7 +62,10 @@ pub enum WorkerMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum JobResult {
-    Succeeded { payload: Vec<u8> },
+    Succeeded {
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+    },
     Failed { message: String },
 }
 
