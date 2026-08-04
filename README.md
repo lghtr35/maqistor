@@ -5,14 +5,14 @@
 [![Container image](https://img.shields.io/badge/GHCR-lghtr35%2Fmaqistor-2496ED?logo=github)](https://github.com/lghtr35/maqistor/pkgs/container/maqistor)
 [![License](https://img.shields.io/github/license/lghtr35/maqistor)](LICENSE)
 
-Maqistor is a durable asynchronous job scheduler for a single machine. It
-accepts work, preserves each job's lifecycle, and routes queued tasks to
-available long-lived workers.
+Maqistor is a lightweight, durable asynchronous executor for background work.
+It gives applications a small, self-hostable execution layer: submit work, send
+it to capable workers, and retain its lifecycle and outcome.
 
-Its model is deliberately small: queues organize work, workers perform it, and
-the scheduler coordinates delivery, retries, and results. Workers can be run
-independently or kept warm under Maqistor's management. Maqistor focuses on
-reliable local execution rather than distributed coordination.
+Queues separate work by purpose, while long-lived workers execute it reliably.
+Run workers yourself or let Maqistor maintain a warm pool of isolated
+containers. It is built for simple, local deployment when you need durable
+execution, not a distributed workflow platform.
 
 ## Install
 
