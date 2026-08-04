@@ -1,8 +1,15 @@
 .git
+.github
+.agents
 **/target
 **/target/**
+data
+manual_test
+benchmark/results
 benchmark/data
+benchmark/certs
 **/*.db
 **/*.db-*
 **/node_modules
 .cursor
+*.sqlite

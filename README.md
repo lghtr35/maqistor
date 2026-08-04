@@ -1,12 +1,13 @@
 # Maqistor
 
-Maqistor is a local, durable asynchronous job scheduler. A single binary accepts
-JSON jobs over HTTP, stores scheduler state in paired SQLite databases, and
-dispatches work to long-lived workers over mutually authenticated TLS. Queues
-can use workers started independently or warm containers supervised by Docker.
+Maqistor is a durable asynchronous job scheduler for a single machine. It
+accepts work, preserves each job's lifecycle, and routes queued tasks to
+available long-lived workers.
 
-It is deliberately a single-host system: it does not provide multi-node
-coordination, HTTP authentication, or an HTTP TLS endpoint.
+Its model is deliberately small: queues organize work, workers perform it, and
+the scheduler coordinates delivery, retries, and results. Workers can be run
+independently or kept warm under Maqistor's management. Maqistor focuses on
+reliable local execution rather than distributed coordination.
 
 ## Install
 
@@ -19,6 +20,32 @@ cargo build -p maqistor --release
 The binary is `target/release/maqistor` (`maqistor.exe` on Windows). Docker is
 required only when at least one queue uses `managed_config`. External-worker-only
 deployments never connect to a Docker daemon.
+
+## Releases and containers
+
+Release tags (`vX.Y.Z`) create a [GitHub Release](https://github.com/lghtr35/maqistor/releases)
+with archives for Linux (x86_64 and ARM64), macOS (Intel and Apple Silicon), and
+Windows (x86_64). Each archive includes the `maqistor` executable and its SHA-256
+checksum is published with the release.
+
+The same tag publishes a multi-platform image to GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/lghtr35/maqistor:vX.Y.Z
+```
+
+For a container deployment, mount the configuration and certificates read-only
+and persist the SQLite files in `/data`. Set the database paths in the mounted
+configuration to `/data/maqistor-ingest.db` and `/data/maqistor-results.db`.
+
+```sh
+docker run --rm --name maqistor \
+  -p 7828:7828 -p 7829:7829 \
+  -v maqistor-data:/data \
+  -v "$(pwd)/maqistor.toml:/config/maqistor.toml:ro" \
+  -v "$(pwd)/certs:/config/certs:ro" \
+  ghcr.io/lghtr35/maqistor:vX.Y.Z --config /config/maqistor.toml
+```
 
 ## Deployment topologies
 
