@@ -17,7 +17,7 @@ is an opaque fence and must be returned unchanged with the result.
 
 ## Reading graph
 
-- [Top-level README](../../README.md) - server setup and mTLS requirements.
-- [dispatcher](../dispatcher/README.md) - server-side protocol consumer.
-- [worker-sdk](../worker-sdk/README.md) - Rust reference implementation.
+- [Top-level README](https://github.com/lghtr35/maqistor/blob/main/README.md) - server setup and mTLS requirements.
+- [dispatcher](https://github.com/lghtr35/maqistor/blob/main/crates/dispatcher/README.md) - server-side protocol consumer.
+- [worker-sdk](https://github.com/lghtr35/maqistor/blob/main/crates/worker-sdk/README.md) - Rust reference implementation.
 - [PROTOCOL.md](PROTOCOL.md) - session behavior and compatibility requirements.

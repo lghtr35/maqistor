@@ -1,0 +1,128 @@
+name: Publish worker crates
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
+
+jobs:
+  detect-version-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      protocol_changed: ${{ steps.versions.outputs.protocol_changed }}
+      sdk_changed: ${{ steps.versions.outputs.sdk_changed }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - id: versions
+        name: Compare worker crate versions
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          crates = {
+              "protocol": "crates/worker-protocol/Cargo.toml",
+              "sdk": "crates/worker-sdk/Cargo.toml",
+          }
+
+          def version(root_manifest, crate_manifest):
+              package_version = crate_manifest["package"]["version"]
+              if isinstance(package_version, dict) and package_version.get("workspace"):
+                  return root_manifest["workspace"]["package"]["version"]
+              return package_version
+
+          def manifest_at(ref, path):
+              contents = subprocess.check_output(
+                  ["git", "show", f"{ref}:{path}"], text=True
+              )
+              return tomllib.loads(contents)
+
+          before = os.environ["BEFORE_SHA"]
+          after_root = tomllib.loads(Path("Cargo.toml").read_text())
+
+          # The all-zero SHA occurs only when the branch is first created; do not
+          # publish every crate merely because main has been created.
+          if set(before) == {"0"}:
+              changes = {name: False for name in crates}
+          else:
+              before_root = manifest_at(before, "Cargo.toml")
+              changes = {}
+              for name, path in crates.items():
+                  try:
+                      before_version = version(before_root, manifest_at(before, path))
+                  except subprocess.CalledProcessError:
+                      # This crate did not exist in the previous main revision.
+                      changes[name] = True
+                  else:
+                      after_version = version(
+                          after_root, tomllib.loads(Path(path).read_text())
+                      )
+                      changes[name] = before_version != after_version
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for name, changed in changes.items():
+                  output.write(f"{name}_changed={'true' if changed else 'false'}\\n")
+          PY
+
+  publish:
+    needs: detect-version-changes
+    if: >-
+      needs.detect-version-changes.outputs.protocol_changed == 'true' ||
+      needs.detect-version-changes.outputs.sdk_changed == 'true'
+    runs-on: ubuntu-latest
+    environment: maqistor-publish-env
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test publishable crates
+        run: cargo test --locked -p maqistor-worker-protocol -p maqistor-worker-sdk
+
+      - name: Package protocol crate
+        if: needs.detect-version-changes.outputs.protocol_changed == 'true'
+        run: cargo package --locked --no-verify -p maqistor-worker-protocol
+
+      - name: Publish protocol crate
+        if: needs.detect-version-changes.outputs.protocol_changed == 'true'
+        run: cargo publish --locked -p maqistor-worker-protocol
+
+      - name: Wait for protocol crate to reach crates.io
+        if: >-
+          needs.detect-version-changes.outputs.protocol_changed == 'true' &&
+          needs.detect-version-changes.outputs.sdk_changed == 'true'
+        shell: bash
+        run: |
+          protocol_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "maqistor-worker-protocol") | .version')"
+
+          for attempt in {1..30}; do
+            if cargo info "maqistor-worker-protocol@${protocol_version}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "maqistor-worker-protocol ${protocol_version} was not indexed by crates.io in time."
+          exit 1
+
+      - name: Publish SDK crate
+        if: needs.detect-version-changes.outputs.sdk_changed == 'true'
+        run: cargo publish --locked -p maqistor-worker-sdk

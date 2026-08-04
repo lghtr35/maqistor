@@ -2,6 +2,13 @@
 name = "maqistor-worker-protocol"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Versioned CBOR wire protocol for Maqistor workers"
+readme = "README.md"
+license-file = "../../LICENSE"
+keywords = ["job", "queue", "worker", "protocol"]
+categories = ["encoding", "network-programming"]
 
 [dependencies]
 serde.workspace = true

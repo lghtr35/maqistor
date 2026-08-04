@@ -1,10 +1,19 @@
 # maqistor-worker-sdk
 
 The Rust reference worker runtime for the
-[Maqistor worker protocol](../worker-protocol/README.md). A `Worker` is a
+[Maqistor worker protocol](https://github.com/lghtr35/maqistor/blob/main/crates/worker-protocol/README.md). A `Worker` is a
 definition (connection, queue name, concurrency, handler). `run` opens one
 session: mutual TLS, register, heartbeats, and a read loop that fills
 concurrency slots with dispatched jobs.
+
+## Install
+
+```toml
+[dependencies]
+maqistor-worker-sdk = "0.1.0"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
 
 ```rust
 use std::num::NonZeroU32;
@@ -42,7 +51,7 @@ contain the queue name and trust the worker client certificate.
 
 ## Reading graph
 
-- [Top-level README](../../README.md) - binary installation and TLS setup.
-- [worker-protocol](../worker-protocol/README.md) - interoperable wire contract.
-- [dispatcher](../dispatcher/README.md) - server-side registration and capacity behavior.
-- [maqistor](../maqistor/README.md) - queue and `worker_tls` configuration.
+- [Top-level README](https://github.com/lghtr35/maqistor/blob/main/README.md) - binary installation and TLS setup.
+- [worker-protocol](https://github.com/lghtr35/maqistor/blob/main/crates/worker-protocol/README.md) - interoperable wire contract.
+- [dispatcher](https://github.com/lghtr35/maqistor/blob/main/crates/dispatcher/README.md) - server-side registration and capacity behavior.
+- [maqistor](https://github.com/lghtr35/maqistor/blob/main/crates/maqistor/README.md) - queue and `worker_tls` configuration.

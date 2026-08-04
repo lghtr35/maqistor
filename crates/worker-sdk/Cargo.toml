@@ -2,9 +2,16 @@
 name = "maqistor-worker-sdk"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Rust SDK for implementing mutually authenticated Maqistor workers"
+readme = "README.md"
+license-file = "../../LICENSE"
+keywords = ["job", "queue", "worker", "scheduler"]
+categories = ["asynchronous", "network-programming"]
 
 [dependencies]
-maqistor-worker-protocol = { path = "../worker-protocol" }
+maqistor-worker-protocol = { version = "0.1.0", path = "../worker-protocol" }
 tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
