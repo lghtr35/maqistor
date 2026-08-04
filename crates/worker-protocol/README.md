@@ -11,8 +11,9 @@ versions are rejected.
 Each connection registers one UUID worker instance for one queue. The worker
 then receives `job_dispatch` frames and sends exactly one matching `job_result`
 for every dispatch. Result capacity values are complete snapshots, not deltas.
-Workers also send periodic heartbeats. `dispatch_id` is an opaque fence and must
-be returned unchanged with the result.
+Workers also send periodic heartbeats. A shutting-down worker sends `drain` and
+waits for `draining` before completing its already accepted jobs. `dispatch_id`
+is an opaque fence and must be returned unchanged with the result.
 
 ## Reading graph
 

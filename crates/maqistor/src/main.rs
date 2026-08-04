@@ -1,15 +1,15 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
+use config::{CleanupConfig, StartupPolicy};
 use maqistor_dispatcher::{
     DockerWorkerSupervisor, ManagedQueue, RegistryDispatcher, TlsFiles, start_worker_listener,
 };
 use maqistor_engine::{DurableStore, Engine, JobQueue, unix_now};
 use maqistor_persistence::SqliteStore;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
-use std::time::{SystemTime, UNIX_EPOCH};
-use config::{CleanupConfig, StartupPolicy};
 
 mod config;
 
@@ -67,21 +67,31 @@ async fn main() -> anyhow::Result<()> {
         config.queues.iter().map(|q| q.name.clone()).collect(),
     )
     .await?;
-    DockerWorkerSupervisor::connect(
-        config
+    if config.has_managed_queues() {
+        let managed = config
             .queues
             .iter()
             .filter(|q| q.managed_config.is_some())
             .map(|q| ManagedQueue {
                 name: q.name.clone(),
-                image: q.managed_config.as_ref().map(|c| c.image.clone()).expect("validated managed image"),
+                image: q
+                    .managed_config
+                    .as_ref()
+                    .map(|c| c.image.clone())
+                    .expect("validated managed image"),
                 replicas: q.replicas(),
-                env: q.managed_config.as_ref().map(|c| c.env().expect("validated managed env")).unwrap_or_default(),
+                env: q
+                    .managed_config
+                    .as_ref()
+                    .map(|c| c.env().expect("validated managed env"))
+                    .unwrap_or_default(),
             })
-            .collect(),
-    )
-    .map_err(|err| anyhow::anyhow!("initialize managed worker supervisor: {err}"))?
-    .spawn();
+            .collect();
+        DockerWorkerSupervisor::connect(managed, &config.docker.connect_options())
+            .await
+            .map_err(|err| anyhow::anyhow!("initialize managed worker supervisor: {err}"))?
+            .spawn();
+    }
     let engine = Engine::with_dispatcher(
         store.clone(),
         RegistryDispatcher::new(worker_registry.clone()),
@@ -140,17 +150,20 @@ fn start_cleanup_task(store: &SqliteStore, config: &CleanupConfig) -> anyhow::Re
 }
 
 async fn cleanup_task(store: &SqliteStore, retention: std::time::Duration) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis();
-        let cutoff = now.saturating_sub(retention.as_millis());
-        let result = store.cleanup_expired_records(cutoff as i64).await;
-        match result {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    debug!("deleted {} expired jobs", deleted);
-                }
-            }
-            Err(err) => {
-                error!("cleanup expired records: {err}");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis();
+    let cutoff = now.saturating_sub(retention.as_millis());
+    let result = store.cleanup_expired_records(cutoff as i64).await;
+    match result {
+        Ok(deleted) => {
+            if deleted > 0 {
+                debug!("deleted {} expired jobs", deleted);
             }
         }
+        Err(err) => {
+            error!("cleanup expired records: {err}");
+        }
+    }
 }

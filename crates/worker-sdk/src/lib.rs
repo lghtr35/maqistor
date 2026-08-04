@@ -1,6 +1,4 @@
-use std::{
-    fs::File, future::Future, io::BufReader, num::NonZeroU32, pin::Pin, sync::Arc,
-};
+use std::{fs::File, future::Future, io::BufReader, num::NonZeroU32, pin::Pin, sync::Arc};
 
 use maqistor_worker_protocol::{
     JobResult, ProtocolError, WireFrame, WorkerMessage, decode_frame, encode_frame,
@@ -11,9 +9,10 @@ use rustls::{
 };
 use serde::de::DeserializeOwned;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::{Semaphore, mpsc},
+    sync::{Semaphore, mpsc, oneshot, watch},
+    task::JoinSet,
 };
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
@@ -36,12 +35,15 @@ pub struct WorkerConnection {
 }
 
 type Handler<P> = Arc<
-    dyn Fn(Job<P>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(Job<P>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>> + Send + Sync,
 >;
 
-type Outbound = mpsc::UnboundedSender<WorkerMessage>;
+type Outbound = mpsc::UnboundedSender<OutboundFrame>;
+
+struct OutboundFrame {
+    payload: WorkerMessage,
+    written: Option<oneshot::Sender<()>>,
+}
 
 pub struct Worker<P> {
     connection: WorkerConnection,
@@ -73,6 +75,14 @@ where
     }
 
     pub async fn run(self) -> Result<(), WorkerRunError> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Run this worker until its session fails or the caller requests a graceful drain.
+    pub async fn run_until<S>(self, shutdown: S) -> Result<(), WorkerRunError>
+    where
+        S: Future<Output = ()> + Send,
+    {
         let tcp = TcpStream::connect(&self.connection.maqistor_addr).await?;
         let server_name = ServerName::try_from(self.connection.server_name.clone())
             .map_err(|_| WorkerRunError::Configuration("invalid TLS server name".into()))?;
@@ -97,8 +107,11 @@ where
         .await?;
 
         let (outbound, inbound) = mpsc::unbounded_channel();
+        let (writer_alive_tx, writer_alive) = watch::channel(true);
         let writer_task = tokio::spawn(async move {
-            writer_loop(writer, inbound).await;
+            let result = writer_loop(writer, inbound).await;
+            let _ = writer_alive_tx.send(false);
+            result
         });
 
         let heartbeats = {
@@ -107,7 +120,7 @@ where
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     interval.tick().await;
-                    if outbound.send(WorkerMessage::Heartbeat).is_err() {
+                    if !send_unacknowledged(&outbound, WorkerMessage::Heartbeat) {
                         break;
                     }
                 }
@@ -120,78 +133,137 @@ where
             concurrency,
             handler,
             slots,
-            outbound,
+            outbound.clone(),
+            shutdown,
+            writer_alive,
         )
         .await;
 
         heartbeats.abort();
-        writer_task.abort();
-        result
+        let _ = heartbeats.await;
+        drop(outbound);
+        match result {
+            Ok(()) => writer_task.await.map_err(|_| WorkerRunError::Stopped)?,
+            Err(error) => {
+                writer_task.abort();
+                let _ = writer_task.await;
+                Err(error)
+            }
+        }
     }
 }
 
-async fn serve<P>(
-    reader: &mut tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionState {
+    Serving,
+    AwaitingDrain,
+    Draining,
+}
+
+async fn serve<P, R, S>(
+    reader: &mut R,
     queue_name: &'static str,
     concurrency: u32,
     handler: Handler<P>,
     slots: Arc<Semaphore>,
     outbound: Outbound,
+    shutdown: S,
+    mut writer_alive: watch::Receiver<bool>,
 ) -> Result<(), WorkerRunError>
 where
     P: DeserializeOwned + Send + 'static,
+    R: AsyncRead + Unpin,
+    S: Future<Output = ()> + Send,
 {
+    let mut jobs = JoinSet::new();
+    let mut state = SessionState::Serving;
+    tokio::pin!(shutdown);
     loop {
-        let message = read_async_frame(reader).await?.payload;
-        match message {
-            WorkerMessage::Registered {
-                queue_name: registered,
-            } if registered == queue_name => {}
-            WorkerMessage::JobDispatch {
-                job_id,
-                dispatch_id,
-                execution_count,
-                payload,
-            } => {
-                let handler = handler.clone();
-                let slots = slots.clone();
-                let outbound = outbound.clone();
-                tokio::spawn(async move {
-                    execute_job(
-                        handler,
-                        slots,
+        if state == SessionState::Draining && jobs.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = &mut shutdown, if state == SessionState::Serving => {
+                send_and_wait(&outbound, WorkerMessage::Drain).await?;
+                state = SessionState::AwaitingDrain;
+            }
+            _ = writer_alive.changed() => return Err(WorkerRunError::Stopped),
+            completed = jobs.join_next(), if !jobs.is_empty() => {
+                match completed {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(_)) => return Err(WorkerRunError::Stopped),
+                    None => {}
+                }
+            }
+            message = read_async_frame(reader) => match message?.payload {
+                WorkerMessage::Registered { queue_name: registered } if registered == queue_name => {}
+                WorkerMessage::JobDispatch {
+                    job_id,
+                    dispatch_id,
+                    execution_count,
+                    payload,
+                } if state != SessionState::Draining => {
+                    jobs.spawn(execute_job(
+                        handler.clone(),
+                        slots.clone(),
                         concurrency,
-                        outbound,
+                        outbound.clone(),
                         job_id,
                         dispatch_id,
                         execution_count,
                         payload,
-                    )
-                    .await;
-                });
-            }
-            WorkerMessage::Error { code, message } => {
-                return Err(WorkerRunError::Remote { code, message });
-            }
-            WorkerMessage::Heartbeat => {}
-            _ => {
-                return Err(WorkerRunError::Configuration(
-                    "unexpected worker frame".into(),
-                ));
+                    ));
+                }
+                WorkerMessage::Draining if state == SessionState::AwaitingDrain => {
+                    state = SessionState::Draining;
+                }
+                WorkerMessage::Error { code, message } => {
+                    return Err(WorkerRunError::Remote { code, message });
+                }
+                WorkerMessage::Heartbeat => {}
+                _ => {
+                    return Err(WorkerRunError::Configuration(
+                        "unexpected worker frame".into(),
+                    ));
+                }
             }
         }
     }
 }
 
-async fn writer_loop(
-    mut writer: tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>,
-    mut inbound: mpsc::UnboundedReceiver<WorkerMessage>,
-) {
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    mut inbound: mpsc::UnboundedReceiver<OutboundFrame>,
+) -> Result<(), WorkerRunError> {
     while let Some(message) = inbound.recv().await {
-        if write_message(&mut writer, message).await.is_err() {
-            break;
+        write_message(&mut writer, message.payload).await?;
+        if let Some(written) = message.written {
+            let _ = written.send(());
         }
     }
+    Ok(())
+}
+
+fn send_unacknowledged(outbound: &Outbound, payload: WorkerMessage) -> bool {
+    outbound
+        .send(OutboundFrame {
+            payload,
+            written: None,
+        })
+        .is_ok()
+}
+
+async fn send_and_wait(outbound: &Outbound, payload: WorkerMessage) -> Result<(), WorkerRunError> {
+    let (written, received) = oneshot::channel();
+    outbound
+        .send(OutboundFrame {
+            payload,
+            written: Some(written),
+        })
+        .map_err(|_| WorkerRunError::Stopped)?;
+    received.await.map_err(|_| WorkerRunError::Stopped)
 }
 
 async fn write_message<W: AsyncWriteExt + Unpin>(
@@ -212,26 +284,29 @@ async fn execute_job<P>(
     dispatch_id: String,
     execution_count: u32,
     payload: Vec<u8>,
-) where
+) -> Result<(), WorkerRunError>
+where
     P: DeserializeOwned + Send + 'static,
 {
     let payload = match serde_json::from_slice(&payload) {
         Ok(payload) => payload,
         Err(err) => {
-            let _ = report(
+            return report(
                 &slots,
                 concurrency,
                 &outbound,
                 job_id,
                 dispatch_id,
                 Err(format!("invalid job payload: {err}")),
-            );
-            return;
+            )
+            .await;
         }
     };
-    let Ok(slot) = slots.clone().acquire_owned().await else {
-        return;
-    };
+    let slot = slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| WorkerRunError::Stopped)?;
     let result = handler(Job {
         id: job_id,
         dispatch_id: dispatch_id.clone(),
@@ -240,10 +315,10 @@ async fn execute_job<P>(
     })
     .await;
     drop(slot);
-    let _ = report(&slots, concurrency, &outbound, job_id, dispatch_id, result);
+    report(&slots, concurrency, &outbound, job_id, dispatch_id, result).await
 }
 
-fn report(
+async fn report(
     slots: &Semaphore,
     concurrency: u32,
     outbound: &Outbound,
@@ -256,15 +331,17 @@ fn report(
         Ok(payload) => JobResult::Succeeded { payload },
         Err(message) => JobResult::Failed { message },
     };
-    outbound
-        .send(WorkerMessage::JobResult {
+    send_and_wait(
+        outbound,
+        WorkerMessage::JobResult {
             job_id,
             dispatch_id,
             result,
             running_jobs: concurrency.saturating_sub(free_slots),
             free_slots,
-        })
-        .map_err(|_| WorkerRunError::Stopped)
+        },
+    )
+    .await
 }
 
 fn client_config(connection: &WorkerConnection) -> Result<ClientConfig, WorkerRunError> {
@@ -320,4 +397,174 @@ pub enum WorkerRunError {
     Io(#[from] std::io::Error),
     #[error("TLS error: {0}")]
     Tls(#[from] rustls::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Mutex, time::Duration};
+
+    use tokio::{
+        io::{duplex, split},
+        sync::Notify,
+        time::timeout,
+    };
+
+    fn handler() -> Handler<serde_json::Value> {
+        Arc::new(|_| Box::pin(async { Ok(vec![1]) }))
+    }
+
+    #[tokio::test]
+    async fn drain_finishes_pre_ack_jobs_before_returning() {
+        let (client, mut server) = duplex(4_096);
+        let (mut reader, writer) = split(client);
+        let (outbound, inbound) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(writer_loop(writer, inbound));
+        let (_writer_alive_tx, writer_alive) = watch::channel(true);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let serve_task = tokio::spawn({
+            let outbound = outbound.clone();
+            async move {
+                serve(
+                    &mut reader,
+                    "email",
+                    1,
+                    handler(),
+                    Arc::new(Semaphore::new(1)),
+                    outbound,
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                    writer_alive,
+                )
+                .await
+            }
+        });
+
+        shutdown_tx.send(()).expect("request drain");
+        assert!(matches!(
+            read_async_frame(&mut server).await.unwrap().payload,
+            WorkerMessage::Drain
+        ));
+
+        write_message(
+            &mut server,
+            WorkerMessage::JobDispatch {
+                job_id: 7,
+                dispatch_id: "dispatch-7".into(),
+                execution_count: 1,
+                payload: b"null".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        write_message(&mut server, WorkerMessage::Draining)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            read_async_frame(&mut server).await.unwrap().payload,
+            WorkerMessage::JobResult { job_id: 7, .. }
+        ));
+        assert!(
+            timeout(Duration::from_secs(1), serve_task)
+                .await
+                .expect("drain finishes")
+                .expect("serve task")
+                .is_ok()
+        );
+
+        drop(outbound);
+        writer_task
+            .await
+            .expect("writer task")
+            .expect("writer result");
+    }
+
+    struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            if let Some(done) = self.0.take() {
+                let _ = done.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_failure_aborts_in_flight_handlers() {
+        let (client, mut server) = duplex(4_096);
+        let (mut reader, writer) = split(client);
+        let (outbound, inbound) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(writer_loop(writer, inbound));
+        let (_writer_alive_tx, writer_alive) = watch::channel(true);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let dropped_tx = Arc::new(Mutex::new(Some(dropped_tx)));
+        let started = Arc::new(Notify::new());
+        let handler: Handler<serde_json::Value> = {
+            let dropped_tx = dropped_tx.clone();
+            let started = started.clone();
+            Arc::new(move |_| {
+                let dropped_tx = dropped_tx.clone();
+                let started = started.clone();
+                Box::pin(async move {
+                    let _guard = NotifyOnDrop(dropped_tx.lock().expect("drop lock").take());
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                    Ok(Vec::new())
+                })
+            })
+        };
+        let started_wait = started.notified();
+
+        let serve_task = tokio::spawn({
+            let outbound = outbound.clone();
+            async move {
+                serve(
+                    &mut reader,
+                    "email",
+                    1,
+                    handler,
+                    Arc::new(Semaphore::new(1)),
+                    outbound,
+                    std::future::pending(),
+                    writer_alive,
+                )
+                .await
+            }
+        });
+
+        write_message(
+            &mut server,
+            WorkerMessage::JobDispatch {
+                job_id: 8,
+                dispatch_id: "dispatch-8".into(),
+                execution_count: 1,
+                payload: b"null".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), started_wait)
+            .await
+            .expect("handler started");
+        drop(server);
+
+        assert!(
+            timeout(Duration::from_secs(1), serve_task)
+                .await
+                .expect("serve returns")
+                .expect("serve task")
+                .is_err()
+        );
+        timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("handler aborted")
+            .expect("drop notification");
+
+        drop(outbound);
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
 }

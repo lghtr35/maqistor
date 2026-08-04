@@ -2,6 +2,22 @@
 # listen = "0.0.0.0:7828"
 # worker_listen = "0.0.0.0:7829"
 
+# Optional Docker daemon for managed worker containers.
+# Only used when any [[queues]] has managed_config; omit entirely for
+# external-worker-only deployments (no Docker required).
+# Empty [docker] / omitted endpoint uses bollard local defaults (Unix socket
+# or Windows named pipe). Point endpoint at a remote daemon when needed.
+# [docker]
+# endpoint = "unix:///var/run/docker.sock"
+# endpoint = "npipe:////./pipe/docker_engine"
+# endpoint = "tcp://192.168.1.10:2376" # unsecured TCP/HTTP is lab-only
+# endpoint = "https://docker.example:2376" # Docker API mTLS
+# HTTPS requires all three explicit mTLS paths; server-auth-only HTTPS is not
+# currently supported.
+# ca_cert_path = "./certs/docker-ca.pem"
+# cert_path = "./certs/docker-cert.pem"
+# key_path = "./certs/docker-key.pem"
+
 # Durable stores + write policy.
 # [persistence]
 # ingest_database = "./data/maqistor-ingest.db"

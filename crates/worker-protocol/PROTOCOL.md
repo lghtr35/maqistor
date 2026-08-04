@@ -21,6 +21,14 @@ The server replies with `registered` for the same queue. A worker may then recei
 
 Workers should send `heartbeat` periodically while connected. Maqistor's SDK uses a five-second interval.
 
+### Graceful drain
+
+A worker that is shutting down sends `drain` and continues reading the session.
+The server stops reserving work for it and replies with `draining`. Any
+`job_dispatch` written before that reply remains accepted and must complete;
+the server writes no further dispatches after the reply. The worker keeps
+heartbeating, reports every accepted job result, then closes the session.
+
 ## Job dispatch and completion
 
 Each `job_dispatch` contains the durable `job_id`, the opaque `dispatch_id` fencing token, an `execution_count`, and raw JSON bytes in `payload`.
@@ -31,7 +39,9 @@ Results with an unknown or stale `dispatch_id` may be ignored by the server. Wor
 
 ## Compatibility
 
-The version is part of every frame. Any incompatible change requires a new CDDL file and a new `protocol_version`; version 1 implementations must continue to reject unknown versions.
+The version is part of every frame. For the MVP, Maqistor server and worker SDK
+releases are deployed together and use protocol version 1; implementations must
+continue to reject unknown protocol versions.
 
 ## Reading graph
 

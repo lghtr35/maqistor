@@ -7,7 +7,7 @@ worker-frame = {
   payload: worker-message
 }
 
-worker-message = register / registered / job-dispatch / job-result / heartbeat / error
+worker-message = register / registered / job-dispatch / job-result / drain / draining / heartbeat / error
 
 register = {
   type: "register",
@@ -49,6 +49,14 @@ succeeded = {
 failed = {
   status: "failed",
   message: tstr
+}
+
+drain = {
+  type: "drain"
+}
+
+draining = {
+  type: "draining"
 }
 
 heartbeat = {

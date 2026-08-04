@@ -1,10 +1,12 @@
 use std::{collections::HashMap, fs, path::Path, time::Duration};
 
-use maqistor_engine::DispatchOptions;
-use maqistor_persistence::{BatchOptions, DurabilityMode, SqliteWriteOptions, default_results_path};
-use serde::Deserialize;
+use chrono::{DateTime, FixedOffset, NaiveTime, Utc};
 use humantime::parse_duration;
-use chrono::{Utc, NaiveTime, DateTime, FixedOffset};
+use maqistor_engine::DispatchOptions;
+use maqistor_persistence::{
+    BatchOptions, DurabilityMode, SqliteWriteOptions, default_results_path,
+};
+use serde::Deserialize;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:7828";
 const DEFAULT_WORKER_LISTEN: &str = "0.0.0.0:7829";
@@ -18,11 +20,33 @@ pub struct AppConfig {
     pub worker_listen: Option<String>,
     pub worker_tls: WorkerTlsConfig,
     #[serde(default)]
+    pub docker: DockerConfig,
+    #[serde(default)]
     pub persistence: PersistenceConfig,
     #[serde(default)]
     pub dispatch: DispatchConfig,
     #[serde(default)]
     pub queues: Vec<QueueConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DockerConfig {
+    pub endpoint: Option<String>,
+    pub ca_cert_path: Option<String>,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+}
+
+impl DockerConfig {
+    pub fn connect_options(&self) -> maqistor_dispatcher::DockerConnectOptions {
+        maqistor_dispatcher::DockerConnectOptions {
+            endpoint: self.endpoint.clone(),
+            ca_cert_path: self.ca_cert_path.clone(),
+            cert_path: self.cert_path.clone(),
+            key_path: self.key_path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -46,7 +70,7 @@ pub struct PersistenceConfig {
 #[serde(deny_unknown_fields)]
 pub struct CleanupConfig {
     interval: String,
-    retention: String, 
+    retention: String,
     vacuum: Option<VacuumConfig>,
 }
 
@@ -223,7 +247,6 @@ pub struct WorkerTlsConfig {
     pub key_path: String,
 }
 
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueConfig {
@@ -235,7 +258,10 @@ pub struct QueueConfig {
 
 impl QueueConfig {
     pub fn replicas(&self) -> u32 {
-        self.managed_config.as_ref().map(|c| c.replicas).unwrap_or(1)
+        self.managed_config
+            .as_ref()
+            .map(|c| c.replicas)
+            .unwrap_or(1)
     }
 }
 
@@ -250,9 +276,14 @@ pub struct ManagedConfig {
 
 impl ManagedConfig {
     pub fn env(&self) -> anyhow::Result<Vec<String>> {
-        let mut res: Vec<String> = self.env_vars.as_ref().map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect()).unwrap_or_default();
+        let mut res: Vec<String> = self
+            .env_vars
+            .as_ref()
+            .map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect())
+            .unwrap_or_default();
         if let Some(env_file) = &self.env_file {
-            let contents = fs::read_to_string(env_file).map_err(|err| anyhow::anyhow!("failed to read env file {env_file:?}: {err}"));
+            let contents = fs::read_to_string(env_file)
+                .map_err(|err| anyhow::anyhow!("failed to read env file {env_file:?}: {err}"));
             match contents {
                 Ok(contents) => {
                     res.extend(contents.lines().map(|line| line.trim().to_string()));
@@ -280,6 +311,7 @@ impl AppConfig {
     fn validate(&self) -> anyhow::Result<()> {
         self.persistence.write_options()?;
         self.dispatch.options()?;
+        validate_docker_config(&self.docker)?;
         if let Some(cleanup) = &self.persistence.cleanup {
             validate_cleanup_config(cleanup)?;
         }
@@ -309,6 +341,10 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn has_managed_queues(&self) -> bool {
+        self.queues.iter().any(|q| q.managed_config.is_some())
+    }
+
     pub fn listen(&self) -> &str {
         self.listen.as_deref().unwrap_or(DEFAULT_LISTEN)
     }
@@ -318,6 +354,56 @@ impl AppConfig {
             .as_deref()
             .unwrap_or(DEFAULT_WORKER_LISTEN)
     }
+}
+
+fn validate_docker_config(docker: &DockerConfig) -> anyhow::Result<()> {
+    let tls_paths = [
+        docker.ca_cert_path.as_deref(),
+        docker.cert_path.as_deref(),
+        docker.key_path.as_deref(),
+    ];
+    let tls_set = tls_paths.iter().filter(|p| p.is_some()).count();
+    if tls_set != 0 && tls_set != 3 {
+        anyhow::bail!("docker TLS requires ca_cert_path, cert_path, and key_path together");
+    }
+    if docker
+        .endpoint
+        .as_deref()
+        .is_some_and(|endpoint| endpoint.starts_with("https://"))
+        && tls_set != 3
+    {
+        anyhow::bail!("https:// Docker endpoints require ca_cert_path, cert_path, and key_path");
+    }
+    if tls_set == 3 {
+        match docker.endpoint.as_deref() {
+            None => anyhow::bail!("docker TLS requires a tcp:// or https:// endpoint"),
+            Some(endpoint)
+                if !(endpoint.starts_with("tcp://") || endpoint.starts_with("https://")) =>
+            {
+                anyhow::bail!("docker TLS is only valid with a tcp:// or https:// endpoint");
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(endpoint) = docker.endpoint.as_deref() {
+        let ok = endpoint.starts_with("unix://")
+            || endpoint.starts_with("npipe://")
+            || endpoint.starts_with("tcp://")
+            || endpoint.starts_with("http://")
+            || endpoint.starts_with("https://");
+        if !ok {
+            anyhow::bail!(
+                "docker.endpoint must use unix://, npipe://, tcp://, http://, or https://"
+            );
+        }
+        if endpoint.trim_end_matches('/').ends_with("://")
+            || endpoint == "unix://"
+            || endpoint == "npipe://"
+        {
+            anyhow::bail!("docker.endpoint must include a path or host");
+        }
+    }
+    Ok(())
 }
 
 fn validate_cleanup_config(cleanup: &CleanupConfig) -> anyhow::Result<()> {
@@ -415,11 +501,12 @@ mod tests {
         );
         assert_eq!(config.dispatch.options().unwrap().idle_probe_batch_size, 12);
 
-        let legacy: AppConfig = toml::from_str(&format!(
-            "{TLS}[dispatch]\nmax_in_flight = 32\n"
-        ))
-        .expect("parse legacy limit");
-        assert_eq!(legacy.dispatch.options().unwrap().max_delivery_in_flight, 32);
+        let legacy: AppConfig = toml::from_str(&format!("{TLS}[dispatch]\nmax_in_flight = 32\n"))
+            .expect("parse legacy limit");
+        assert_eq!(
+            legacy.dispatch.options().unwrap().max_delivery_in_flight,
+            32
+        );
     }
 
     #[test]
@@ -494,7 +581,10 @@ mod tests {
             "{TLS}[persistence]\ningest_database = './data/ingest.db'\nresults_database = './data/results.db'\n"
         ))
         .expect("parse");
-        assert_eq!(config.persistence.ingest_database_path(), "./data/ingest.db");
+        assert_eq!(
+            config.persistence.ingest_database_path(),
+            "./data/ingest.db"
+        );
         assert_eq!(
             config.persistence.results_database_path(),
             "./data/results.db"
@@ -511,5 +601,95 @@ mod tests {
                 .replace('\\', "/")
                 .ends_with("maqistor-results.db")
         );
+    }
+
+    #[test]
+    fn docker_section_defaults_and_parses_endpoint() {
+        let defaults: AppConfig = toml::from_str(TLS).expect("parse");
+        assert_eq!(defaults.docker, DockerConfig::default());
+        assert!(!defaults.has_managed_queues());
+        assert!(defaults.validate().is_ok());
+
+        let remote: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'tcp://192.168.1.10:2375'\n"
+        ))
+        .expect("parse");
+        assert_eq!(
+            remote.docker.endpoint.as_deref(),
+            Some("tcp://192.168.1.10:2375")
+        );
+        assert!(remote.validate().is_ok());
+
+        let local: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'unix:///var/run/docker.sock'\n"
+        ))
+        .expect("parse");
+        assert!(local.validate().is_ok());
+    }
+
+    #[test]
+    fn docker_tls_requires_explicit_mtls_paths() {
+        let partial: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'tcp://192.168.1.10:2376'\nca_cert_path = 'ca.pem'\n"
+        ))
+        .expect("parse");
+        assert!(partial.validate().is_err());
+
+        let tls_without_endpoint: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nca_cert_path = 'ca.pem'\ncert_path = 'cert.pem'\nkey_path = 'key.pem'\n"
+        ))
+        .expect("parse");
+        assert!(tls_without_endpoint.validate().is_err());
+
+        let tls_on_unix: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'unix:///var/run/docker.sock'\nca_cert_path = 'ca.pem'\ncert_path = 'cert.pem'\nkey_path = 'key.pem'\n"
+        ))
+        .expect("parse");
+        assert!(tls_on_unix.validate().is_err());
+
+        let https_without_mtls: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'https://docker.example:2376'\n"
+        ))
+        .expect("parse");
+        assert!(https_without_mtls.validate().is_err());
+
+        let tls_on_http: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'http://docker.example:2376'\nca_cert_path = 'ca.pem'\ncert_path = 'cert.pem'\nkey_path = 'key.pem'\n"
+        ))
+        .expect("parse");
+        assert!(tls_on_http.validate().is_err());
+
+        let ok: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'tcp://192.168.1.10:2376'\nca_cert_path = 'ca.pem'\ncert_path = 'cert.pem'\nkey_path = 'key.pem'\n"
+        ))
+        .expect("parse");
+        assert!(ok.validate().is_ok());
+        assert_eq!(
+            ok.docker.connect_options().endpoint.as_deref(),
+            Some("tcp://192.168.1.10:2376")
+        );
+
+        let https: AppConfig = toml::from_str(&format!(
+            "{TLS}[docker]\nendpoint = 'https://docker.example:2376'\nca_cert_path = 'ca.pem'\ncert_path = 'cert.pem'\nkey_path = 'key.pem'\n"
+        ))
+        .expect("parse");
+        assert!(https.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_docker_endpoint_scheme() {
+        let bad: AppConfig =
+            toml::from_str(&format!("{TLS}[docker]\nendpoint = 'ssh://host'\n")).expect("parse");
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn has_managed_queues_detects_managed_config() {
+        let managed: AppConfig = toml::from_str(&format!(
+            "{TLS}[[queues]]\nname = 'email'\nmax_retries = 3\ntimeout_secs = 60\n[queues.managed_config]\nimage = 'ghcr.io/example/email:1.0.0'\nreplicas = 2\n"
+        ))
+        .expect("parse");
+        assert!(managed.has_managed_queues());
+        assert!(managed.validate().is_ok());
     }
 }

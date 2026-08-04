@@ -16,9 +16,30 @@ Build the server from source with a current Rust toolchain:
 cargo build -p maqistor --release
 ```
 
-The binary is `target/release/maqistor` (`maqistor.exe` on Windows). The current
-binary initializes its Docker supervisor at startup, so Docker must be available
-even when all queues use independently run workers.
+The binary is `target/release/maqistor` (`maqistor.exe` on Windows). Docker is
+required only when at least one queue uses `managed_config`. External-worker-only
+deployments never connect to a Docker daemon.
+
+## Deployment topologies
+
+Workers are always mTLS TCP peers of `worker_listen`. Docker only supervises
+optional managed replicas. Layouts can be combined on the same queues:
+
+- **External-only:** no `[docker]`, no `managed_config`. Workers dial a
+  reachable `worker_listen` address.
+- **Host + local Docker:** omit `[docker]` or set a local `unix://` /
+  `npipe://` endpoint. Managed siblings and independently started workers may
+  attach to the same queue names.
+- **Maqistor-in-container:** mount the host Docker socket and/or set
+  `[docker].endpoint` (host Docker or one remote daemon). Bind
+  `worker_listen` to `0.0.0.0` and publish the port and/or join a Docker
+  network. Sibling managed workers dial via network service name, published
+  host port, or `host.docker.internal`. Remote/external workers dial the same
+  published/routable listener over mTLS.
+- **Remote single daemon:** set `[docker].endpoint` to `tcp://...` for an
+  unsecured lab daemon, or `https://...` with explicit CA, client certificate,
+  and client key paths for Docker API mTLS. Containers are managed on that
+  daemon; every worker still needs a routable path to maqistor's listen port.
 
 ## Set up
 

@@ -19,15 +19,19 @@ job lifecycle or persistence.
 
 ## Managed workers
 
-`DockerWorkerSupervisor` reconciles every queue with `managed_config` every
-five seconds. It starts matching existing containers, creates missing ones, and
-replaces a managed container when its configured image changes. Managed
-containers are labelled `io.maqistor.managed=true` and use Docker's
-`unless-stopped` restart policy.
+`DockerWorkerSupervisor` runs only when the binary has at least one queue with
+`managed_config`. It reconciles those queues every five seconds: starts matching
+existing containers, creates missing ones, and replaces a managed container when
+its configured image or env drifts. Managed containers are labelled
+`io.maqistor.managed=true` and use Docker's `unless-stopped` restart policy.
 
+Connection uses bollard local defaults unless `[docker]` sets an explicit
+`endpoint` (Unix socket, Windows named pipe, or a single remote TCP daemon).
+Remote Docker API TLS is explicit mTLS: `https://` requires CA, client
+certificate, and client key paths. Independently started workers use the same
+protocol and can connect to any configured queue alongside managed siblings.
 The binary supplies managed-worker configuration; see
-[maqistor](../maqistor/README.md). Independently started workers use the same
-protocol and can connect to any configured queue.
+[maqistor](../maqistor/README.md).
 
 ## Reading graph
 

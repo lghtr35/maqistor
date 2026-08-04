@@ -23,9 +23,22 @@ Worker::new(connection, "email", NonZeroU32::new(16).unwrap(), |_: Job<serde_jso
 ```
 
 `run` returns if connection, TLS, protocol, or remote errors occur; callers
-that need process-level reconnection should supervise and restart it. The
-server configuration must contain the queue name and trust the worker client
-certificate.
+that need process-level reconnection should supervise and restart it. To drain
+on a process lifecycle signal, pass a caller-owned future to `run_until`:
+
+```rust,no_run
+# use maqistor_worker_sdk::Worker;
+# async fn example(worker: Worker<serde_json::Value>) -> Result<(), Box<dyn std::error::Error>> {
+worker.run_until(async {
+    tokio::signal::ctrl_c().await.expect("install Ctrl-C handler");
+}).await?;
+# Ok(())
+# }
+```
+
+After the signal, the worker stops accepting new jobs, completes accepted jobs,
+reports their results, and closes the session. The server configuration must
+contain the queue name and trust the worker client certificate.
 
 ## Reading graph
 

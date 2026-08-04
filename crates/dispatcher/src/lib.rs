@@ -7,9 +7,9 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bollard::{
-    Docker,
+    API_DEFAULT_VERSION, Docker,
     container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions},
     image::CreateImageOptions,
     models::{HostConfig, RestartPolicy, RestartPolicyNameEnum},
@@ -58,7 +58,8 @@ impl WorkerDispatcher for RegistryDispatcher {
             for request in queues {
                 for _ in 0..request.count {
                     let Some((worker_id, state)) = workers.iter_mut().find(|(_, worker)| {
-                        worker.queue_name == request.queue_name
+                        !worker.draining
+                            && worker.queue_name == request.queue_name
                             && worker.free_slots.saturating_sub(worker.reserved_slots) > 0
                     }) else {
                         break;
@@ -92,15 +93,23 @@ impl WorkerDispatcher for RegistryDispatcher {
             execution_count: job.execution_count,
             payload: job.payload,
         });
-        let outbound = {
-            let workers = permit.registry.0.lock().await;
-            workers
-                .get(&permit.worker_id)
-                .map(|worker| worker.outbound.clone())
-        }
-        .ok_or_else(|| DispatchError::Internal("reserved worker disappeared".into()))?;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let queued = outbound.send(OutboundFrame { frame, ack: ack_tx }).is_ok();
+        let queued = {
+            let mut workers = permit.registry.0.lock().await;
+            let Some(worker) = workers.get_mut(&permit.worker_id) else {
+                return Err(DispatchError::Internal(
+                    "reserved worker disappeared".into(),
+                ));
+            };
+            if worker.draining {
+                worker.reserved_slots = worker.reserved_slots.saturating_sub(1);
+                return Err(DispatchError::Internal("worker is draining".into()));
+            }
+            worker
+                .outbound
+                .send(OutboundFrame { frame, ack: ack_tx })
+                .is_ok()
+        };
         let wrote = queued && matches!(ack_rx.await, Ok(Ok(())));
         if !wrote {
             release_permit(&permit.registry, permit.worker_id).await;
@@ -133,6 +142,7 @@ struct WorkerState {
     free_slots: u32,
     last_activity: Instant,
     reserved_slots: u32,
+    draining: bool,
     outbound: mpsc::UnboundedSender<OutboundFrame>,
 }
 
@@ -162,6 +172,20 @@ fn record_worker_capacity(state: &mut WorkerState, running_jobs: u32, free_slots
     state.free_slots = free_slots;
     state.reserved_slots = 0;
 }
+
+fn begin_drain(state: &mut WorkerState) -> Result<()> {
+    state.draining = true;
+    state.free_slots = 0;
+    let (ack, _ignored) = tokio::sync::oneshot::channel();
+    state
+        .outbound
+        .send(OutboundFrame {
+            frame: WireFrame::v1(WorkerMessage::Draining),
+            ack,
+        })
+        .map_err(|_| anyhow::anyhow!("worker writer stopped during drain"))?;
+    Ok(())
+}
 #[derive(Clone)]
 pub struct WorkerRegistry(
     Arc<Mutex<HashMap<Uuid, WorkerState>>>,
@@ -181,6 +205,89 @@ pub struct ManagedQueue {
     pub env: Vec<String>,
 }
 
+/// How to reach the Docker daemon used for managed worker containers.
+///
+/// An empty / default value uses bollard local defaults (Unix socket or Windows
+/// named pipe). Set `endpoint` for an explicit socket, named pipe, or remote
+/// TCP daemon. TLS paths must be supplied together for `tcp://` / `https://`
+/// endpoints; `https://` always uses explicit mTLS.
+#[derive(Debug, Clone, Default)]
+pub struct DockerConnectOptions {
+    pub endpoint: Option<String>,
+    pub ca_cert_path: Option<String>,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+}
+
+const DOCKER_CONNECT_TIMEOUT_SECS: u64 = 120;
+
+fn connect_docker(options: &DockerConnectOptions) -> Result<Docker> {
+    match options.endpoint.as_deref() {
+        None => Docker::connect_with_local_defaults().context("connect to Docker"),
+        Some(endpoint) if endpoint.starts_with("unix://") => {
+            #[cfg(unix)]
+            {
+                Docker::connect_with_unix(
+                    endpoint,
+                    DOCKER_CONNECT_TIMEOUT_SECS,
+                    API_DEFAULT_VERSION,
+                )
+                .context("connect to Docker via unix socket")
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = endpoint;
+                bail!("unix:// Docker endpoints are only supported on Unix hosts");
+            }
+        }
+        Some(endpoint) if endpoint.starts_with("npipe://") => {
+            #[cfg(windows)]
+            {
+                Docker::connect_with_named_pipe(
+                    endpoint,
+                    DOCKER_CONNECT_TIMEOUT_SECS,
+                    API_DEFAULT_VERSION,
+                )
+                .context("connect to Docker via named pipe")
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = endpoint;
+                bail!("npipe:// Docker endpoints are only supported on Windows hosts");
+            }
+        }
+        Some(endpoint)
+            if endpoint.starts_with("tcp://")
+                || endpoint.starts_with("http://")
+                || endpoint.starts_with("https://") =>
+        {
+            match (
+                options.ca_cert_path.as_deref(),
+                options.cert_path.as_deref(),
+                options.key_path.as_deref(),
+            ) {
+                (Some(ca), Some(cert), Some(key)) => Docker::connect_with_ssl(
+                    endpoint,
+                    std::path::Path::new(key),
+                    std::path::Path::new(cert),
+                    std::path::Path::new(ca),
+                    DOCKER_CONNECT_TIMEOUT_SECS,
+                    API_DEFAULT_VERSION,
+                )
+                .context("connect to Docker via TLS"),
+                (None, None, None) => Docker::connect_with_http(
+                    endpoint,
+                    DOCKER_CONNECT_TIMEOUT_SECS,
+                    API_DEFAULT_VERSION,
+                )
+                .context("connect to Docker via HTTP"),
+                _ => bail!("docker TLS requires ca_cert_path, cert_path, and key_path together"),
+            }
+        }
+        Some(endpoint) => bail!("unsupported docker endpoint scheme: {endpoint}"),
+    }
+}
+
 #[derive(Clone)]
 pub struct DockerWorkerSupervisor {
     docker: Docker,
@@ -188,9 +295,14 @@ pub struct DockerWorkerSupervisor {
     desired_images: Arc<Mutex<HashMap<String, String>>>,
 }
 impl DockerWorkerSupervisor {
-    pub fn connect(queues: Vec<ManagedQueue>) -> Result<Self> {
+    pub async fn connect(
+        queues: Vec<ManagedQueue>,
+        options: &DockerConnectOptions,
+    ) -> Result<Self> {
+        let docker = connect_docker(options)?;
+        docker.ping().await.context("ping Docker daemon")?;
         Ok(Self {
-            docker: Docker::connect_with_local_defaults().context("connect to Docker")?,
+            docker,
             queues,
             desired_images: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -484,6 +596,7 @@ async fn handle_worker(
                 free_slots,
                 last_activity: Instant::now(),
                 reserved_slots: 0,
+                draining: false,
                 outbound: outbound.clone(),
             },
         );
@@ -519,31 +632,35 @@ async fn handle_worker(
                     .context("worker disappeared")?;
                 state.last_activity = Instant::now();
                 match frame.payload {
-                WorkerMessage::JobResult {
-                    job_id,
-                    dispatch_id,
-                    result,
-                    running_jobs,
-                    free_slots,
-                } => {
-                    record_worker_capacity(state, running_jobs, free_slots);
-                    let outcome = match result {
-                        maqistor_worker_protocol::JobResult::Succeeded { payload } => {
-                            JobOutcome::Succeeded(payload)
-                        }
-                        maqistor_worker_protocol::JobResult::Failed { message } => {
-                            JobOutcome::Failed(message)
-                        }
-                    };
-                    Some(WorkerEvent::Result {
-                        queue_name: state.queue_name.clone(),
-                        result: WorkerResult {
-                            job_id,
-                            dispatch_id,
-                            outcome,
-                        },
-                    })
-                }
+                    WorkerMessage::JobResult {
+                        job_id,
+                        dispatch_id,
+                        result,
+                        running_jobs,
+                        free_slots,
+                    } => {
+                        record_worker_capacity(state, running_jobs, free_slots);
+                        let outcome = match result {
+                            maqistor_worker_protocol::JobResult::Succeeded { payload } => {
+                                JobOutcome::Succeeded(payload)
+                            }
+                            maqistor_worker_protocol::JobResult::Failed { message } => {
+                                JobOutcome::Failed(message)
+                            }
+                        };
+                        Some(WorkerEvent::Result {
+                            queue_name: state.queue_name.clone(),
+                            result: WorkerResult {
+                                job_id,
+                                dispatch_id,
+                                outcome,
+                            },
+                        })
+                    }
+                    WorkerMessage::Drain => {
+                        begin_drain(state)?;
+                        None
+                    }
                     WorkerMessage::Heartbeat => None,
                     _ => anyhow::bail!("invalid post-registration worker frame"),
                 }
@@ -571,6 +688,7 @@ mod tests {
             free_slots: 0,
             last_activity: Instant::now(),
             reserved_slots: 3,
+            draining: false,
             outbound,
         };
 
@@ -579,5 +697,90 @@ mod tests {
         assert_eq!(worker.reserved_slots, 0);
         assert_eq!(worker.running_jobs, 2);
         assert_eq!(worker.free_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn draining_workers_are_not_reserved() {
+        let (outbound, _inbound) = mpsc::unbounded_channel();
+        let worker_id = Uuid::new_v4();
+        let registry = WorkerRegistry::default();
+        registry.0.lock().await.insert(
+            worker_id,
+            WorkerState {
+                queue_name: "email".into(),
+                running_jobs: 0,
+                free_slots: 1,
+                last_activity: Instant::now(),
+                reserved_slots: 0,
+                draining: true,
+                outbound,
+            },
+        );
+
+        let reserved = RegistryDispatcher::new(registry)
+            .reserve(vec![QueueReservation {
+                queue_name: "email".into(),
+                count: 1,
+            }])
+            .await
+            .expect("reserve succeeds");
+
+        assert!(reserved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_ack_follows_a_dispatch_queued_before_drain() {
+        let (outbound, mut inbound) = mpsc::unbounded_channel();
+        let worker_id = Uuid::new_v4();
+        let registry = WorkerRegistry::default();
+        registry.0.lock().await.insert(
+            worker_id,
+            WorkerState {
+                queue_name: "email".into(),
+                running_jobs: 0,
+                free_slots: 1,
+                last_activity: Instant::now(),
+                reserved_slots: 1,
+                draining: false,
+                outbound,
+            },
+        );
+        let dispatcher = RegistryDispatcher::new(registry.clone());
+        let mut accepted = maqistor_engine::AcceptedJob::new("email", b"{}".to_vec());
+        accepted.id = 9;
+        accepted.dispatch_id = Some("dispatch-9".into());
+        let job = Job::from_accepted(accepted, None);
+        let permit = ReservedDispatch::new(
+            "email".into(),
+            Box::new(RegistryPermit {
+                worker_id,
+                registry: registry.clone(),
+            }),
+        );
+
+        let dispatch = tokio::spawn(async move { dispatcher.dispatch(permit, job).await });
+        let dispatch_frame = inbound.recv().await.expect("queued dispatch");
+        assert!(matches!(
+            dispatch_frame.frame.payload,
+            WorkerMessage::JobDispatch { job_id: 9, .. }
+        ));
+
+        begin_drain(
+            registry
+                .0
+                .lock()
+                .await
+                .get_mut(&worker_id)
+                .expect("worker exists"),
+        )
+        .expect("queue drain acknowledgement");
+        let drain_frame = inbound.recv().await.expect("queued drain acknowledgement");
+        assert!(matches!(drain_frame.frame.payload, WorkerMessage::Draining));
+
+        dispatch_frame.ack.send(Ok(())).expect("ack dispatch write");
+        dispatch
+            .await
+            .expect("dispatch task")
+            .expect("dispatch result");
     }
 }

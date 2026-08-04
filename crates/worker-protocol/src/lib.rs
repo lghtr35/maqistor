@@ -44,6 +44,10 @@ pub enum WorkerMessage {
         running_jobs: u32,
         free_slots: u32,
     },
+    /// Stop assigning new jobs to this worker while it completes accepted work.
+    Drain,
+    /// The server has stopped assigning new jobs to this worker.
+    Draining,
     Heartbeat,
     Registered {
         queue_name: String,
@@ -138,5 +142,13 @@ mod tests {
     fn round_trip() {
         let frame = WireFrame::v1(WorkerMessage::Heartbeat);
         assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+    }
+
+    #[test]
+    fn drain_messages_round_trip() {
+        for payload in [WorkerMessage::Drain, WorkerMessage::Draining] {
+            let frame = WireFrame::v1(payload);
+            assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        }
     }
 }
