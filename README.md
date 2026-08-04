@@ -1,5 +1,10 @@
 # Maqistor
 
+[![CI](https://github.com/lghtr35/maqistor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lghtr35/maqistor/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/lghtr35/maqistor?display_name=tag&sort=semver)](https://github.com/lghtr35/maqistor/releases/latest)
+[![Container image](https://img.shields.io/badge/GHCR-lghtr35%2Fmaqistor-2496ED?logo=github)](https://github.com/lghtr35/maqistor/pkgs/container/maqistor)
+[![License](https://img.shields.io/github/license/lghtr35/maqistor)](LICENSE)
+
 Maqistor is a durable asynchronous job scheduler for a single machine. It
 accepts work, preserves each job's lifecycle, and routes queued tasks to
 available long-lived workers.
