@@ -53,16 +53,16 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: maqistor-x86_64-unknown-linux-gnu.tar.gz
+            asset: maqistor-linux-x86_64.tar.gz
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: maqistor-aarch64-unknown-linux-gnu.tar.gz
+            asset: maqistor-linux-aarch64.tar.gz
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            asset: maqistor-x86_64-apple-darwin.tar.gz
+            asset: maqistor-macos-x86_64.tar.gz
           - runner: macos-15
             target: aarch64-apple-darwin
-            asset: maqistor-aarch64-apple-darwin.tar.gz
+            asset: maqistor-macos-aarch64.tar.gz
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -93,7 +93,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ASSET: maqistor-x86_64-pc-windows-msvc.zip
+      ASSET: maqistor-windows-x86_64.zip
 
     steps:
       - uses: actions/checkout@v6
