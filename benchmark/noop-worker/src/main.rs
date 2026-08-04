@@ -1,13 +1,6 @@
 use std::num::NonZeroU32;
 
-use maqistor_worker_sdk::{Queue, Worker, WorkerConnection};
-
-struct BenchQueue;
-
-impl Queue for BenchQueue {
-    type Payload = serde_json::Value;
-    const NAME: &'static str = "bench";
-}
+use maqistor_worker_sdk::{Job, Worker, WorkerConnection};
 
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
@@ -26,8 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_key_path: env("MAQISTOR_CLIENT_KEY_PATH", "/certs/worker-key.pem"),
     };
 
-    Worker::<BenchQueue>::new(connection, concurrency, |_| async { Ok(Vec::new()) })
-        .run()
-        .await?;
+    Worker::new(connection, "bench", concurrency, |_: Job<serde_json::Value>| async {
+        Ok(Vec::new())
+    })
+    .run()
+    .await?;
     Ok(())
 }

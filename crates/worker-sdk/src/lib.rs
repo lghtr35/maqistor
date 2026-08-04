@@ -1,6 +1,5 @@
 use std::{
-    fs::File, future::Future, io::BufReader, marker::PhantomData, num::NonZeroU32, pin::Pin,
-    sync::Arc,
+    fs::File, future::Future, io::BufReader, num::NonZeroU32, pin::Pin, sync::Arc,
 };
 
 use maqistor_worker_protocol::{
@@ -14,15 +13,10 @@ use serde::de::DeserializeOwned;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, Semaphore},
+    sync::{Semaphore, mpsc},
 };
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
-
-pub trait Queue: Send + Sync + 'static {
-    type Payload: DeserializeOwned + Send + 'static;
-    const NAME: &'static str;
-}
 
 #[derive(Debug)]
 pub struct Job<T> {
@@ -41,31 +35,40 @@ pub struct WorkerConnection {
     pub client_key_path: String,
 }
 
-type Handler<Q> = Arc<
-    dyn Fn(
-            Job<<Q as Queue>::Payload>,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
+type Handler<P> = Arc<
+    dyn Fn(Job<P>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
         + Send
         + Sync,
 >;
 
-pub struct Worker<Q: Queue> {
+type Outbound = mpsc::UnboundedSender<WorkerMessage>;
+
+pub struct Worker<P> {
     connection: WorkerConnection,
     concurrency: NonZeroU32,
-    handler: Handler<Q>,
-    _queue: PhantomData<Q>,
+    handler: Handler<P>,
+    queue_name: &'static str,
 }
-impl<Q: Queue> Worker<Q> {
-    pub fn new<F, Fut>(connection: WorkerConnection, concurrency: NonZeroU32, handler: F) -> Self
+
+impl<P> Worker<P>
+where
+    P: DeserializeOwned + Send + 'static,
+{
+    pub fn new<F, Fut>(
+        connection: WorkerConnection,
+        queue_name: &'static str,
+        concurrency: NonZeroU32,
+        handler: F,
+    ) -> Self
     where
-        F: Fn(Job<Q::Payload>) -> Fut + Send + Sync + 'static,
+        F: Fn(Job<P>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>, String>> + Send + 'static,
     {
         Self {
             connection,
             concurrency,
             handler: Arc::new(move |job| Box::pin(handler(job))),
-            _queue: PhantomData,
+            queue_name,
         }
     }
 
@@ -75,66 +78,193 @@ impl<Q: Queue> Worker<Q> {
             .map_err(|_| WorkerRunError::Configuration("invalid TLS server name".into()))?;
         let connector = TlsConnector::from(Arc::new(client_config(&self.connection)?));
         let stream = connector.connect(server_name, tcp).await?;
-        let (mut reader, writer) = tokio::io::split(stream);
-        let instance_id = Uuid::new_v4();
-        let lifecycle: AsyncWorkerLifecycle<Q> = AsyncWorkerLifecycle {
-            stream: Arc::new(Mutex::new(writer)),
-            handler: self.handler,
-            slots: Arc::new(Semaphore::new(self.concurrency.get() as usize)),
-            concurrency: self.concurrency.get(),
-            _queue: PhantomData,
-        };
-        lifecycle
-            .write(WorkerMessage::Register {
-                instance_id,
-                queue_name: Q::NAME.into(),
+        let (mut reader, mut writer) = tokio::io::split(stream);
+
+        let queue_name = self.queue_name;
+        let concurrency = self.concurrency.get();
+        let handler = self.handler;
+        let slots = Arc::new(Semaphore::new(concurrency as usize));
+
+        write_message(
+            &mut writer,
+            WorkerMessage::Register {
+                instance_id: Uuid::new_v4(),
+                queue_name: queue_name.into(),
                 running_jobs: 0,
-                free_slots: self.concurrency.get(),
-            })
-            .await?;
+                free_slots: concurrency,
+            },
+        )
+        .await?;
+
+        let (outbound, inbound) = mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(async move {
+            writer_loop(writer, inbound).await;
+        });
+
         let heartbeats = {
-            let lifecycle = lifecycle.clone();
+            let outbound = outbound.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     interval.tick().await;
-                    if lifecycle.write(WorkerMessage::Heartbeat).await.is_err() {
+                    if outbound.send(WorkerMessage::Heartbeat).is_err() {
                         break;
                     }
                 }
             })
         };
-        loop {
-            let message = read_async_frame(&mut reader).await?.payload;
-            match message {
-                WorkerMessage::Registered { queue_name } if queue_name == Q::NAME => {}
-                WorkerMessage::JobDispatch {
-                    job_id,
-                    dispatch_id,
-                    execution_count,
-                    payload,
-                } => {
-                    let lifecycle = lifecycle.clone();
-                    tokio::spawn(async move {
-                        let _ = lifecycle
-                            .execute_dispatch(job_id, dispatch_id, execution_count, payload)
-                            .await;
-                    });
-                }
-                WorkerMessage::Error { code, message } => {
-                    heartbeats.abort();
-                    return Err(WorkerRunError::Remote { code, message });
-                }
-                WorkerMessage::Heartbeat => {}
-                _ => {
-                    heartbeats.abort();
-                    return Err(WorkerRunError::Configuration(
-                        "unexpected worker frame".into(),
-                    ));
-                }
+
+        let result = serve(
+            &mut reader,
+            queue_name,
+            concurrency,
+            handler,
+            slots,
+            outbound,
+        )
+        .await;
+
+        heartbeats.abort();
+        writer_task.abort();
+        result
+    }
+}
+
+async fn serve<P>(
+    reader: &mut tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>,
+    queue_name: &'static str,
+    concurrency: u32,
+    handler: Handler<P>,
+    slots: Arc<Semaphore>,
+    outbound: Outbound,
+) -> Result<(), WorkerRunError>
+where
+    P: DeserializeOwned + Send + 'static,
+{
+    loop {
+        let message = read_async_frame(reader).await?.payload;
+        match message {
+            WorkerMessage::Registered {
+                queue_name: registered,
+            } if registered == queue_name => {}
+            WorkerMessage::JobDispatch {
+                job_id,
+                dispatch_id,
+                execution_count,
+                payload,
+            } => {
+                let handler = handler.clone();
+                let slots = slots.clone();
+                let outbound = outbound.clone();
+                tokio::spawn(async move {
+                    execute_job(
+                        handler,
+                        slots,
+                        concurrency,
+                        outbound,
+                        job_id,
+                        dispatch_id,
+                        execution_count,
+                        payload,
+                    )
+                    .await;
+                });
+            }
+            WorkerMessage::Error { code, message } => {
+                return Err(WorkerRunError::Remote { code, message });
+            }
+            WorkerMessage::Heartbeat => {}
+            _ => {
+                return Err(WorkerRunError::Configuration(
+                    "unexpected worker frame".into(),
+                ));
             }
         }
     }
+}
+
+async fn writer_loop(
+    mut writer: tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>,
+    mut inbound: mpsc::UnboundedReceiver<WorkerMessage>,
+) {
+    while let Some(message) = inbound.recv().await {
+        if write_message(&mut writer, message).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn write_message<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    payload: WorkerMessage,
+) -> Result<(), WorkerRunError> {
+    let frame = WireFrame::v1(payload);
+    writer.write_all(&encode_frame(&frame)?).await?;
+    Ok(())
+}
+
+async fn execute_job<P>(
+    handler: Handler<P>,
+    slots: Arc<Semaphore>,
+    concurrency: u32,
+    outbound: Outbound,
+    job_id: i64,
+    dispatch_id: String,
+    execution_count: u32,
+    payload: Vec<u8>,
+) where
+    P: DeserializeOwned + Send + 'static,
+{
+    let payload = match serde_json::from_slice(&payload) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let _ = report(
+                &slots,
+                concurrency,
+                &outbound,
+                job_id,
+                dispatch_id,
+                Err(format!("invalid job payload: {err}")),
+            );
+            return;
+        }
+    };
+    let Ok(slot) = slots.clone().acquire_owned().await else {
+        return;
+    };
+    let result = handler(Job {
+        id: job_id,
+        dispatch_id: dispatch_id.clone(),
+        execution_count,
+        payload,
+    })
+    .await;
+    drop(slot);
+    let _ = report(&slots, concurrency, &outbound, job_id, dispatch_id, result);
+}
+
+fn report(
+    slots: &Semaphore,
+    concurrency: u32,
+    outbound: &Outbound,
+    job_id: i64,
+    dispatch_id: String,
+    result: Result<Vec<u8>, String>,
+) -> Result<(), WorkerRunError> {
+    let free_slots = slots.available_permits() as u32;
+    let result = match result {
+        Ok(payload) => JobResult::Succeeded { payload },
+        Err(message) => JobResult::Failed { message },
+    };
+    outbound
+        .send(WorkerMessage::JobResult {
+            job_id,
+            dispatch_id,
+            result,
+            running_jobs: concurrency.saturating_sub(free_slots),
+            free_slots,
+        })
+        .map_err(|_| WorkerRunError::Stopped)
 }
 
 fn client_config(connection: &WorkerConnection) -> Result<ClientConfig, WorkerRunError> {
@@ -174,88 +304,6 @@ async fn read_async_frame<R: AsyncRead + Unpin>(
     let mut frame = length.to_vec();
     frame.extend(body);
     decode_frame(&frame)
-}
-
-struct AsyncWorkerLifecycle<Q: Queue> {
-    stream: Arc<Mutex<tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>>>,
-    handler: Handler<Q>,
-    slots: Arc<Semaphore>,
-    concurrency: u32,
-    _queue: PhantomData<Q>,
-}
-impl<Q: Queue> Clone for AsyncWorkerLifecycle<Q> {
-    fn clone(&self) -> Self {
-        Self {
-            stream: self.stream.clone(),
-            handler: self.handler.clone(),
-            slots: self.slots.clone(),
-            concurrency: self.concurrency,
-            _queue: PhantomData,
-        }
-    }
-}
-impl<Q: Queue> AsyncWorkerLifecycle<Q> {
-    async fn write(&self, payload: WorkerMessage) -> Result<(), WorkerRunError> {
-        let frame = WireFrame::v1(payload);
-        let mut stream = self.stream.lock().await;
-        stream.write_all(&encode_frame(&frame)?).await?;
-        Ok(())
-    }
-    async fn execute_dispatch(
-        &self,
-        job_id: i64,
-        dispatch_id: String,
-        execution_count: u32,
-        payload: Vec<u8>,
-    ) -> Result<(), WorkerRunError> {
-        let payload = match serde_json::from_slice(&payload) {
-            Ok(payload) => payload,
-            Err(err) => {
-                self.report(
-                    job_id,
-                    dispatch_id,
-                    Err(format!("invalid job payload: {err}")),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let slot = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| WorkerRunError::Stopped)?;
-        let result = (self.handler)(Job {
-            id: job_id,
-            dispatch_id: dispatch_id.clone(),
-            execution_count,
-            payload,
-        })
-        .await;
-        drop(slot);
-        self.report(job_id, dispatch_id, result).await
-    }
-    async fn report(
-        &self,
-        job_id: i64,
-        dispatch_id: String,
-        result: Result<Vec<u8>, String>,
-    ) -> Result<(), WorkerRunError> {
-        let free_slots = self.slots.available_permits() as u32;
-        let result = match result {
-            Ok(payload) => JobResult::Succeeded { payload },
-            Err(message) => JobResult::Failed { message },
-        };
-        self.write(WorkerMessage::JobResult {
-            job_id,
-            dispatch_id,
-            result,
-            running_jobs: self.concurrency.saturating_sub(free_slots),
-            free_slots,
-        })
-        .await
-    }
 }
 
 #[derive(Debug, thiserror::Error)]

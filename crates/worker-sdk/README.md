@@ -1,22 +1,14 @@
 # maqistor-worker-sdk
 
 The Rust reference worker runtime for the
-[Maqistor worker protocol](../worker-protocol/README.md). It establishes mutual
-TLS, registers a queue, sends five-second heartbeats, deserializes JSON payloads,
-enforces local concurrency, and returns success or failure results.
-
-Implement `Queue` with a static queue name and a deserializable payload, then
-run a `Worker` with a nonzero concurrency limit:
+[Maqistor worker protocol](../worker-protocol/README.md). A `Worker` is a
+definition (connection, queue name, concurrency, handler). `run` opens one
+session: mutual TLS, register, heartbeats, and a read loop that fills
+concurrency slots with dispatched jobs.
 
 ```rust
 use std::num::NonZeroU32;
-use maqistor_worker_sdk::{Queue, Worker, WorkerConnection};
-
-struct Email;
-impl Queue for Email {
-    type Payload = serde_json::Value;
-    const NAME: &'static str = "email";
-}
+use maqistor_worker_sdk::{Job, Worker, WorkerConnection};
 
 let connection = WorkerConnection {
     maqistor_addr: "127.0.0.1:7829".into(),
@@ -25,7 +17,7 @@ let connection = WorkerConnection {
     client_cert_path: "certs/worker-cert.pem".into(),
     client_key_path: "certs/worker-key.pem".into(),
 };
-Worker::<Email>::new(connection, NonZeroU32::new(16).unwrap(), |_job| async {
+Worker::new(connection, "email", NonZeroU32::new(16).unwrap(), |_: Job<serde_json::Value>| async {
     Ok(Vec::new())
 }).run().await?;
 ```
