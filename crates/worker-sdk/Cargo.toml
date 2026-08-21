@@ -11,7 +11,7 @@ keywords = ["job", "queue", "worker", "scheduler"]
 categories = ["asynchronous", "network-programming"]
 
 [dependencies]
-maqistor-worker-protocol = { version = "0.1.0", path = "../worker-protocol" }
+maqistor-worker-protocol = { version = "0.2.0", path = "../worker-protocol" }
 tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true

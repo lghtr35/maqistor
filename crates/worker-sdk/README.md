@@ -10,7 +10,7 @@ concurrency slots with dispatched jobs.
 
 ```toml
 [dependencies]
-maqistor-worker-sdk = "0.1.0"
+maqistor-worker-sdk = "0.2.0"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```

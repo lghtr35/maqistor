@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 When the crate is published, replace the path dependency with a version:
 
 ```toml
-maqistor-client-sdk = "0.1.0"
+maqistor-client-sdk = "0.2.0"
 ```
 
 ## Example

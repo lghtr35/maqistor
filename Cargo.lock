@@ -985,7 +985,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "maqistor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "maqistor-dispatcher",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-benchmark-noop-worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "maqistor-worker-sdk",
  "serde_json",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-client-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "maqistor-types",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-dispatcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bollard",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "serde",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-persistence"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "maqistor-engine",
  "rusqlite",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-worker-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "maqistor-worker-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "maqistor-worker-protocol",
  "rustls",
