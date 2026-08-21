@@ -6,21 +6,9 @@ use axum::{
     routing::{get, post},
 };
 use maqistor_engine::{DurableStore, Engine, EngineError, JobView, SubmitJob, WorkerDispatcher};
-use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobRequest {
-    pub name: String,
-    pub payload: serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobResponse {
-    pub id: i64,
-    pub name: String,
-    pub status: String,
-}
+pub use maqistor_types::{ErrorBody, JobRequest, JobResponse};
 
 #[derive(Clone)]
 struct ApiState<S: DurableStore, D: WorkerDispatcher> {
@@ -38,11 +26,6 @@ where
         .route("/jobs/{id}", get(get_job::<S, D>))
         .layer(TraceLayer::new_for_http())
         .with_state(ApiState { engine })
-}
-
-#[derive(Serialize)]
-struct ErrorBody {
-    error: String,
 }
 
 struct ApiError {

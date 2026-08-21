@@ -6,8 +6,10 @@ members = [
     "crates/dispatcher",
     "crates/engine",
     "crates/persistence",
+    "crates/types",
     "crates/worker-protocol",
     "crates/worker-sdk",
+    "crates/client-sdk",
     "benchmark/noop-worker",
 ]
 
@@ -24,6 +26,8 @@ maqistor-api = { path = "crates/api" }
 maqistor-dispatcher = { path = "crates/dispatcher" }
 maqistor-engine = { path = "crates/engine" }
 maqistor-persistence = { path = "crates/persistence" }
+maqistor-types = { path = "crates/types" }
+maqistor-client-sdk = { path = "crates/client-sdk" }
 
 # External crates
 anyhow = "1"
@@ -34,6 +38,7 @@ chrono = "0.4"
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 humantime = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

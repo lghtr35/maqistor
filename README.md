@@ -91,13 +91,29 @@ optional managed replicas. Layouts can be combined on the same queues:
    .\target\release\maqistor.exe --config .\maqistor.toml
    ```
 
-5. Verify the server, then submit a job for a configured queue:
+5. Verify the server, then submit a job for a configured queue. Raw HTTP:
 
    ```powershell
    Invoke-WebRequest http://127.0.0.1:7828/health
    Invoke-RestMethod http://127.0.0.1:7828/jobs -Method Post `
      -ContentType 'application/json' `
      -Body '{"name":"example","payload":{"message":"hello"}}'
+   ```
+
+   Or use the thin Rust [client SDK](crates/client-sdk/README.md):
+
+   ```rust
+   use maqistor_client_sdk::{JobRequest, MaqistorClient, MaqistorHttpClient};
+   use serde_json::json;
+
+   let client = MaqistorHttpClient::new("http://127.0.0.1:7828");
+   let job = client
+       .enqueue(JobRequest {
+           name: "example".into(),
+           payload: json!({"message": "hello"}),
+       })
+       .await?;
+   let _ = client.get_job(job.id).await?;
    ```
 
 The HTTP endpoint returns only job identity and status. A connected worker is
@@ -110,14 +126,18 @@ Start with the executable and follow the links for the layer you are changing:
 ```text
 maqistor binary
   -> HTTP API -> Engine <- SQLite persistence
-                   |
-                   -> Dispatcher <-> Worker protocol <- Rust worker SDK
+       ^            |
+       |            -> Dispatcher <-> Worker protocol <- Rust worker SDK
+  client SDK
+  (HTTP today; shared types in maqistor-types)
 ```
 
 | Concern | Resource |
 | --- | --- |
 | Binary, configuration, startup, and operational boundaries | [crates/maqistor](crates/maqistor/README.md) |
 | HTTP contract | [crates/api](crates/api/README.md) |
+| Shared job request/response types | [crates/types](crates/types/README.md) |
+| Thin job submission / query clients | [crates/client-sdk](crates/client-sdk/README.md) |
 | Scheduling, lifecycle, retries, and ports | [crates/engine](crates/engine/README.md) |
 | SQLite schema, durability, and batching | [crates/persistence](crates/persistence/README.md) |
 | Worker registry, mTLS listener, and Docker supervision | [crates/dispatcher](crates/dispatcher/README.md) |

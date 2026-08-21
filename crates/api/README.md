@@ -17,5 +17,7 @@ on the router.
 ## Reading graph
 
 - [Top-level README](../../README.md) - endpoint setup and security boundary.
+- [types](../types/README.md) - shared request/response bodies.
+- [client-sdk](../client-sdk/README.md) - thin HTTP client for these routes.
 - [engine](../engine/README.md) - commands and errors used by this adapter.
 - [maqistor](../maqistor/README.md) - binary wiring and listener configuration.
