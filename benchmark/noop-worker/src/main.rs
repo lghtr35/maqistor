@@ -19,9 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_key_path: env("MAQISTOR_CLIENT_KEY_PATH", "/certs/worker-key.pem"),
     };
 
-    Worker::new(connection, "bench", concurrency, |_: Job<serde_json::Value>| async {
-        Ok(Vec::new())
-    })
+    Worker::new(
+        connection,
+        "bench",
+        concurrency,
+        |_: Job<serde_json::Value>| async { Ok(Vec::new()) },
+    )
     .run()
     .await?;
     Ok(())

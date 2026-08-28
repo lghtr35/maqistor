@@ -10,9 +10,7 @@ use tracing::debug;
 
 use maqistor_engine::{Execution, JobOutcome, JobQueue, StoreError};
 
-use super::adaptive::{
-    AdaptiveBatchController, FlushReason, ResultsLane, ResultsLaneController,
-};
+use super::adaptive::{AdaptiveBatchController, FlushReason, ResultsLane, ResultsLaneController};
 use super::bulk::{self, ROWS_PER_STATEMENT};
 use super::common::{
     EXECUTION_WITH_QUEUE_COLUMNS, EXECUTION_WITH_QUEUE_FROM, ReadPool, RwConnection,
@@ -201,19 +199,15 @@ impl ResultsConn {
                 Some("executions.status IN ('failed', 'pending')"),
                 Some("job_id, execution_count, dispatch_id, updated_at"),
             );
-            let upserted = bulk::query_pairs_cached_tx(
-                &tx,
-                &sql,
-                params_from_iter(values),
-                |row| {
+            let upserted =
+                bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
                     ))
-                },
-            )?;
+                })?;
             let lease_by_id: std::collections::HashMap<i64, i64> = chunk
                 .iter()
                 .map(|row| (row.job_id, row.lease_expires_at))
@@ -297,13 +291,12 @@ impl ResultsConn {
                      AND executions.status = 'running'",
                     Some("executions.job_id, executions.dispatch_id"),
                 );
-                let updated = bulk::query_pairs_cached_tx(
-                    &tx,
-                    &sql,
-                    params_from_iter(values),
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )?;
-                let updated: std::collections::HashSet<(i64, String)> = updated.into_iter().collect();
+                let updated =
+                    bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                let updated: std::collections::HashSet<(i64, String)> =
+                    updated.into_iter().collect();
                 for &i in chunk {
                     let pending = &batch[i];
                     if updated.contains(&(pending.job_id, pending.dispatch_id.clone())) {
@@ -338,19 +331,15 @@ impl ResultsConn {
                          executions.execution_count, executions.queue_name",
                     ),
                 );
-                let updated = bulk::query_pairs_cached_tx(
-                    &tx,
-                    &sql,
-                    params_from_iter(values),
-                    |row| {
+                let updated =
+                    bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, i64>(2)?,
                             row.get::<_, String>(3)?,
                         ))
-                    },
-                )?;
+                    })?;
                 let mut queue_limits: std::collections::HashMap<String, i64> =
                     std::collections::HashMap::new();
                 for (_, _, _, queue_name) in &updated {
@@ -375,16 +364,16 @@ impl ResultsConn {
                     .collect();
                 for &i in chunk {
                     let pending = &batch[i];
-                    dispositions[i] = match by_key.get(&(pending.job_id, pending.dispatch_id.clone()))
-                    {
-                        Some((execution_count, max_retries))
-                            if *execution_count <= *max_retries =>
-                        {
-                            CompletionDisposition::Repend
-                        }
-                        Some(_) => CompletionDisposition::Completed,
-                        None => CompletionDisposition::Ignored,
-                    };
+                    dispositions[i] =
+                        match by_key.get(&(pending.job_id, pending.dispatch_id.clone())) {
+                            Some((execution_count, max_retries))
+                                if *execution_count <= *max_retries =>
+                            {
+                                CompletionDisposition::Repend
+                            }
+                            Some(_) => CompletionDisposition::Completed,
+                            None => CompletionDisposition::Ignored,
+                        };
                 }
             }
 
@@ -423,10 +412,7 @@ impl ResultsConn {
         Ok(())
     }
 
-    fn recover_stale(
-        &mut self,
-        now: i64,
-    ) -> Result<Vec<RecoveredStale>, StoreError> {
+    fn recover_stale(&mut self, now: i64) -> Result<Vec<RecoveredStale>, StoreError> {
         let sql = format!(
             "SELECT {EXECUTION_WITH_QUEUE_COLUMNS}
              {EXECUTION_WITH_QUEUE_FROM}
@@ -478,19 +464,15 @@ impl ResultsConn {
                      executions.execution_count",
                 ),
             );
-            let updated = bulk::query_pairs_cached_tx(
-                &tx,
-                &sql,
-                params_from_iter(values),
-                |row| {
+            let updated =
+                bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
                     ))
-                },
-            )?;
+                })?;
             for (id, job_id, dispatch_id, execution_count) in updated {
                 let execution_count = u32::try_from(execution_count)
                     .map_err(|err| StoreError::Internal(err.to_string()))?;
@@ -512,13 +494,15 @@ impl ResultsConn {
             .conn
             .prepare("DELETE FROM executions WHERE updated_at < ?1")
             .map_err(|err| StoreError::Internal(err.to_string()))?;
-        let rows_affected = statement.execute(params![cutoff])
+        let rows_affected = statement
+            .execute(params![cutoff])
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(rows_affected)
     }
 
     fn vacuum(&mut self) -> Result<(), StoreError> {
-        self.conn.execute_batch("VACUUM;")
+        self.conn
+            .execute_batch("VACUUM;")
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(())
     }
@@ -659,7 +643,6 @@ impl ResultsHandle {
         .await
     }
 
-
     pub(crate) async fn abandon(&self, job_id: i64, dispatch_id: &str) -> Result<(), StoreError> {
         let dispatch_id = dispatch_id.to_string();
         self.call(|reply| ResultsRequest::Abandon {
@@ -670,18 +653,12 @@ impl ResultsHandle {
         .await
     }
 
-    pub(crate) async fn recover_stale(
-        &self,
-        now: i64,
-    ) -> Result<Vec<RecoveredStale>, StoreError> {
+    pub(crate) async fn recover_stale(&self, now: i64) -> Result<Vec<RecoveredStale>, StoreError> {
         self.call(|reply| ResultsRequest::RecoverStale { now, reply })
-        .await
+            .await
     }
 
-    pub(crate) async fn execution(
-        &self,
-        job_id: i64,
-    ) -> Result<Option<Execution>, StoreError> {
+    pub(crate) async fn execution(&self, job_id: i64) -> Result<Option<Execution>, StoreError> {
         self.reads.execution(job_id).await
     }
 
@@ -691,8 +668,7 @@ impl ResultsHandle {
     }
 
     pub(crate) async fn vacuum(&self) -> Result<(), StoreError> {
-        self.call(|reply| ResultsRequest::Vacuum { reply })
-            .await
+        self.call(|reply| ResultsRequest::Vacuum { reply }).await
     }
 }
 
@@ -1127,7 +1103,9 @@ mod results_writer_tests {
                 )
                 .unwrap();
             match lane {
-                ResultsLane::Dispatch => run_dispatch_turn(&mut conn, &mut queues, &mut lane_controller),
+                ResultsLane::Dispatch => {
+                    run_dispatch_turn(&mut conn, &mut queues, &mut lane_controller)
+                }
                 ResultsLane::Completion => {
                     run_complete_turn(
                         &mut conn,
@@ -1146,9 +1124,11 @@ mod results_writer_tests {
 
         let status: String = conn
             .conn
-            .query_row("SELECT status FROM executions WHERE job_id = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT status FROM executions WHERE job_id = 1",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(status, "completed");
 

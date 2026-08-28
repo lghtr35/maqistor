@@ -1,8 +1,6 @@
-﻿use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
-use maqistor_engine::{
-    DispatchError, DispatchPermit, Job, ReservedDispatch, WorkerDispatcher,
-};
+use maqistor_engine::{DispatchError, DispatchPermit, Job, ReservedDispatch, WorkerDispatcher};
 
 #[derive(Clone, Default)]
 struct RecordingDispatcher(Arc<Mutex<Vec<Job>>>);
@@ -16,11 +14,7 @@ impl DispatchPermit for TestPermit {
 }
 
 impl WorkerDispatcher for RecordingDispatcher {
-    async fn dispatch(
-        &self,
-        _permit: ReservedDispatch,
-        job: Job,
-    ) -> Result<(), DispatchError> {
+    async fn dispatch(&self, _permit: ReservedDispatch, job: Job) -> Result<(), DispatchError> {
         self.0.lock().unwrap().push(job);
         Ok(())
     }

@@ -85,6 +85,17 @@ async fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .map(|c| c.env().expect("validated managed env"))
                     .unwrap_or_default(),
+                mounts: q
+                    .managed_config
+                    .as_ref()
+                    .and_then(|c| c.mounts.as_ref())
+                    .map(|mounts| {
+                        mounts
+                            .iter()
+                            .map(|m| m.to_dispatcher_type().expect("validated managed mount"))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
             .collect();
         DockerWorkerSupervisor::connect(managed, &config.docker.connect_options())
