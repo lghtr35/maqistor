@@ -18,7 +18,7 @@ execution, not a distributed workflow platform.
 
 Build the server from source with a current Rust toolchain:
 
-```powershell
+```bash
 cargo build -p maqistor --release
 ```
 
@@ -35,7 +35,7 @@ checksum is published with the release.
 
 The same tag publishes a multi-platform image to GitHub Container Registry:
 
-```sh
+```bash
 docker pull ghcr.io/lghtr35/maqistor:vX.Y.Z
 ```
 
@@ -43,7 +43,7 @@ For a container deployment, mount the configuration and certificates read-only
 and persist the SQLite files in `/data`. Set the database paths in the mounted
 configuration to `/data/maqistor-ingest.db` and `/data/maqistor-results.db`.
 
-```sh
+```bash
 docker run --rm --name maqistor \
   -p 7828:7828 -p 7829:7829 \
   -v maqistor-data:/data \
@@ -87,17 +87,17 @@ optional managed replicas. Layouts can be combined on the same queues:
 4. Start the binary from the directory used by the relative paths in the
    configuration:
 
-   ```powershell
-   .\target\release\maqistor.exe --config .\maqistor.toml
+   ```bash
+   ./target/release/maqistor --config ./maqistor.toml
    ```
 
 5. Verify the server, then submit a job for a configured queue. Raw HTTP:
 
-   ```powershell
-   Invoke-WebRequest http://127.0.0.1:7828/health
-   Invoke-RestMethod http://127.0.0.1:7828/jobs -Method Post `
-     -ContentType 'application/json' `
-     -Body '{"name":"example","payload":{"message":"hello"}}'
+   ```bash
+   curl -i http://127.0.0.1:7828/health
+   curl -sS -X POST http://127.0.0.1:7828/jobs \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"example","payload":{"message":"hello"}}'
    ```
 
    Or use the thin Rust [client SDK](crates/client-sdk/README.md):
@@ -147,7 +147,7 @@ maqistor binary
 
 ## Checks
 
-```powershell
+```bash
 cargo check --workspace --all-targets
 cargo test --workspace
 ```

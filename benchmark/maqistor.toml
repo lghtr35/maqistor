@@ -50,3 +50,7 @@ image = "maqistor-benchmark-noop-worker:0.1.0"
 replicas = 4
 [queues.managed_config.env_vars]
 MAQISTOR_WORKER_CONCURRENCY = "8192"
+[[queues.managed_config.mounts]]
+source = "./benchmark/certs"
+target = "/certs"
+read_only = true

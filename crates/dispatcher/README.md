@@ -22,7 +22,7 @@ job lifecycle or persistence.
 `DockerWorkerSupervisor` runs only when the binary has at least one queue with
 `managed_config`. It reconciles those queues every five seconds: starts matching
 existing containers, creates missing ones, and replaces a managed container when
-its configured image or env drifts. Managed containers are labelled
+its configured image, env, or bind mounts drift. Managed containers are labelled
 `io.maqistor.managed=true` and use Docker's `unless-stopped` restart policy.
 
 Connection uses bollard local defaults unless `[docker]` sets an explicit

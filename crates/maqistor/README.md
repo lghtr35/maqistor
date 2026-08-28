@@ -27,7 +27,7 @@ annotated template. Important sections are:
 | `docker` | Optional single Docker endpoint (and optional daemon TLS) for managed replicas |
 | `persistence` | Ingest/results database paths, durability, startup recovery, cleanup, and writer batching |
 | `dispatch` | Claim-batch, delivery-budget, and idle-probe limits |
-| `queues` | Queue retry/timeout policy; optional `managed_config` provides Docker image, replicas, and environment |
+| `queues` | Queue retry/timeout policy; optional `managed_config` provides Docker image, replicas, environment, and bind mounts |
 
 Workers may always connect independently to a configured queue. `managed_config`
 adds Docker-maintained workers; it does not change the worker protocol. Sibling
