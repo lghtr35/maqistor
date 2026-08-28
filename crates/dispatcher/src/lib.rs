@@ -57,18 +57,14 @@ impl WorkerDispatcher for RegistryDispatcher {
             let mut reserved = Vec::new();
             for request in queues {
                 for _ in 0..request.count {
-                    let Some((worker_id, state)) = workers.iter_mut().find(|(_, worker)| {
-                        !worker.draining
-                            && worker.queue_name == request.queue_name
-                            && worker.free_slots.saturating_sub(worker.reserved_slots) > 0
-                    }) else {
+                    let Some((worker_id, state)) = find_ideal_worker(&mut workers, &request) else {
                         break;
                     };
-                    state.reserved_slots += 1;
+                    state.reserved_slots = state.reserved_slots.saturating_add(1);
                     reserved.push(ReservedDispatch::new(
                         request.queue_name.clone(),
                         Box::new(RegistryPermit {
-                            worker_id: *worker_id,
+                            worker_id,
                             registry: registry.clone(),
                         }),
                     ));
@@ -89,7 +85,7 @@ impl WorkerDispatcher for RegistryDispatcher {
             .ok_or_else(|| DispatchError::Internal("claimed job has no dispatch id".into()))?;
         let frame = WireFrame::v1(WorkerMessage::JobDispatch {
             job_id: job.id,
-            dispatch_id,
+            dispatch_id: dispatch_id.clone(),
             execution_count: job.execution_count,
             payload: job.payload,
         });
@@ -105,14 +101,24 @@ impl WorkerDispatcher for RegistryDispatcher {
                 worker.reserved_slots = worker.reserved_slots.saturating_sub(1);
                 return Err(DispatchError::Internal("worker is draining".into()));
             }
-            worker
+            worker.reserved_slots = worker.reserved_slots.saturating_sub(1);
+            if !worker.in_flight_dispatches.insert(dispatch_id.clone()) {
+                return Err(DispatchError::Internal(
+                    "duplicate worker dispatch id".into(),
+                ));
+            }
+            let queued = worker
                 .outbound
                 .send(OutboundFrame { frame, ack: ack_tx })
-                .is_ok()
+                .is_ok();
+            if !queued {
+                worker.in_flight_dispatches.remove(&dispatch_id);
+            }
+            queued
         };
         let wrote = queued && matches!(ack_rx.await, Ok(Ok(())));
         if !wrote {
-            release_permit(&permit.registry, permit.worker_id).await;
+            release_dispatched(&permit.registry, permit.worker_id, &dispatch_id).await;
             return Err(DispatchError::Internal(
                 "worker dispatch write failed".into(),
             ));
@@ -129,6 +135,46 @@ impl WorkerDispatcher for RegistryDispatcher {
     }
 }
 
+fn find_ideal_worker<'a>(
+    workers: &'a mut HashMap<Uuid, WorkerState>,
+    request: &QueueReservation,
+) -> Option<(Uuid, &'a mut WorkerState)> {
+    let mut ideal_worker_id: Option<&Uuid> = None;
+    let mut ideal_worker: Option<&WorkerState> = None;
+    for (id, worker) in workers.iter() {
+        if !worker.draining
+            && worker.queue_name == request.queue_name
+            && available_slots(worker) > 0
+        {
+            let Some(current) = ideal_worker else {
+                ideal_worker_id = Some(id);
+                ideal_worker = Some(worker);
+                continue;
+            };
+            match compare_load(worker, current) {
+                std::cmp::Ordering::Less => {
+                    ideal_worker_id = Some(id);
+                    ideal_worker = Some(worker);
+                }
+                std::cmp::Ordering::Equal if id < ideal_worker_id.expect("ideal worker exists") => {
+                    ideal_worker_id = Some(id);
+                    ideal_worker = Some(worker);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let id = *ideal_worker_id?;
+    workers.get_mut(&id).map(|state| (id, state))
+}
+
+fn compare_load(left: &WorkerState, right: &WorkerState) -> std::cmp::Ordering {
+    let left_scaled = u64::from(used_slots(left)) * u64::from(right.capacity_slots.max(1));
+    let right_scaled = u64::from(used_slots(right)) * u64::from(left.capacity_slots.max(1));
+    left_scaled.cmp(&right_scaled)
+}
+
 #[derive(Debug, Clone)]
 pub struct TlsFiles {
     pub ca_cert_path: String,
@@ -138,10 +184,12 @@ pub struct TlsFiles {
 #[derive(Debug, Clone)]
 struct WorkerState {
     queue_name: String,
+    capacity_slots: u32,
     running_jobs: u32,
     free_slots: u32,
     last_activity: Instant,
     reserved_slots: u32,
+    in_flight_dispatches: HashSet<String>,
     draining: bool,
     outbound: mpsc::UnboundedSender<OutboundFrame>,
 }
@@ -167,10 +215,32 @@ async fn release_permit(registry: &WorkerRegistry, worker_id: Uuid) {
     }
 }
 
-fn record_worker_capacity(state: &mut WorkerState, running_jobs: u32, free_slots: u32) {
+async fn release_dispatched(registry: &WorkerRegistry, worker_id: Uuid, dispatch_id: &str) {
+    if let Some(worker) = registry.0.lock().await.get_mut(&worker_id) {
+        worker.in_flight_dispatches.remove(dispatch_id);
+    }
+}
+
+fn used_slots(state: &WorkerState) -> u32 {
+    let in_flight = u32::try_from(state.in_flight_dispatches.len()).unwrap_or(u32::MAX);
+    state
+        .reserved_slots
+        .saturating_add(state.running_jobs.max(in_flight))
+}
+
+fn available_slots(state: &WorkerState) -> u32 {
+    state.capacity_slots.saturating_sub(used_slots(state))
+}
+
+fn record_worker_result(
+    state: &mut WorkerState,
+    dispatch_id: &str,
+    running_jobs: u32,
+    free_slots: u32,
+) {
     state.running_jobs = running_jobs;
     state.free_slots = free_slots;
-    state.reserved_slots = 0;
+    state.in_flight_dispatches.remove(dispatch_id);
 }
 
 fn begin_drain(state: &mut WorkerState) -> Result<()> {
@@ -648,10 +718,12 @@ async fn handle_worker(
             instance_id,
             WorkerState {
                 queue_name: queue_name.clone(),
+                capacity_slots: running_jobs.saturating_add(free_slots),
                 running_jobs,
                 free_slots,
                 last_activity: Instant::now(),
                 reserved_slots: 0,
+                in_flight_dispatches: HashSet::new(),
                 draining: false,
                 outbound: outbound.clone(),
             },
@@ -695,7 +767,7 @@ async fn handle_worker(
                         running_jobs,
                         free_slots,
                     } => {
-                        record_worker_capacity(state, running_jobs, free_slots);
+                        record_worker_result(state, &dispatch_id, running_jobs, free_slots);
                         let outcome = match result {
                             maqistor_worker_protocol::JobResult::Succeeded { payload } => {
                                 JobOutcome::Succeeded(payload)
@@ -759,23 +831,108 @@ mod tests {
     }
 
     #[test]
-    fn worker_result_replaces_reservation_estimate_with_capacity_snapshot() {
+    fn worker_result_releases_only_its_matching_dispatch() {
         let (outbound, _rx) = mpsc::unbounded_channel();
         let mut worker = WorkerState {
             queue_name: "email".into(),
-            running_jobs: 3,
+            capacity_slots: 2,
+            running_jobs: 2,
             free_slots: 0,
             last_activity: Instant::now(),
-            reserved_slots: 3,
+            reserved_slots: 0,
+            in_flight_dispatches: HashSet::from(["dispatch-1".into(), "dispatch-2".into()]),
             draining: false,
             outbound,
         };
 
-        record_worker_capacity(&mut worker, 2, 1);
+        record_worker_result(&mut worker, "dispatch-1", 1, 1);
 
         assert_eq!(worker.reserved_slots, 0);
-        assert_eq!(worker.running_jobs, 2);
+        assert_eq!(
+            worker.in_flight_dispatches,
+            HashSet::from(["dispatch-2".into()])
+        );
+        assert_eq!(worker.running_jobs, 1);
         assert_eq!(worker.free_slots, 1);
+        assert_eq!(available_slots(&worker), 1);
+    }
+
+    #[test]
+    fn compares_normalized_worker_loads_exactly() {
+        let (outbound, _inbound) = mpsc::unbounded_channel();
+        let half_loaded = WorkerState {
+            queue_name: "email".into(),
+            capacity_slots: 2,
+            running_jobs: 1,
+            free_slots: 1,
+            last_activity: Instant::now(),
+            reserved_slots: 0,
+            in_flight_dispatches: HashSet::new(),
+            draining: false,
+            outbound,
+        };
+        let (outbound, _inbound) = mpsc::unbounded_channel();
+        let quarter_loaded = WorkerState {
+            queue_name: "email".into(),
+            capacity_slots: 4,
+            running_jobs: 1,
+            free_slots: 3,
+            last_activity: Instant::now(),
+            reserved_slots: 0,
+            in_flight_dispatches: HashSet::new(),
+            draining: false,
+            outbound,
+        };
+
+        assert_eq!(
+            compare_load(&quarter_loaded, &half_loaded),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_load(&half_loaded, &quarter_loaded),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[tokio::test]
+    async fn reservations_never_exceed_registered_capacity() {
+        let (outbound, _inbound) = mpsc::unbounded_channel();
+        let worker_id = Uuid::new_v4();
+        let registry = WorkerRegistry::default();
+        registry.0.lock().await.insert(
+            worker_id,
+            WorkerState {
+                queue_name: "email".into(),
+                capacity_slots: 2,
+                running_jobs: 0,
+                free_slots: 2,
+                last_activity: Instant::now(),
+                reserved_slots: 0,
+                in_flight_dispatches: HashSet::new(),
+                draining: false,
+                outbound,
+            },
+        );
+
+        let reserved = RegistryDispatcher::new(registry.clone())
+            .reserve(vec![QueueReservation {
+                queue_name: "email".into(),
+                count: 3,
+            }])
+            .await
+            .expect("reserve succeeds");
+
+        assert_eq!(reserved.len(), 2);
+        assert_eq!(
+            registry
+                .0
+                .lock()
+                .await
+                .get(&worker_id)
+                .expect("worker exists")
+                .reserved_slots,
+            2
+        );
     }
 
     #[tokio::test]
@@ -787,10 +944,12 @@ mod tests {
             worker_id,
             WorkerState {
                 queue_name: "email".into(),
+                capacity_slots: 1,
                 running_jobs: 0,
                 free_slots: 1,
                 last_activity: Instant::now(),
                 reserved_slots: 0,
+                in_flight_dispatches: HashSet::new(),
                 draining: true,
                 outbound,
             },
@@ -808,6 +967,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserves_the_least_loaded_worker() {
+        let busy_id = Uuid::new_v4();
+        let idle_id = Uuid::new_v4();
+        let registry = WorkerRegistry::default();
+        {
+            let mut workers = registry.0.lock().await;
+            let (outbound, _inbound) = mpsc::unbounded_channel();
+            workers.insert(
+                busy_id,
+                WorkerState {
+                    queue_name: "email".into(),
+                    capacity_slots: 2,
+                    running_jobs: 1,
+                    free_slots: 1,
+                    last_activity: Instant::now(),
+                    reserved_slots: 0,
+                    in_flight_dispatches: HashSet::new(),
+                    draining: false,
+                    outbound,
+                },
+            );
+            let (outbound, _inbound) = mpsc::unbounded_channel();
+            workers.insert(
+                idle_id,
+                WorkerState {
+                    queue_name: "email".into(),
+                    capacity_slots: 2,
+                    running_jobs: 0,
+                    free_slots: 2,
+                    last_activity: Instant::now(),
+                    reserved_slots: 0,
+                    in_flight_dispatches: HashSet::new(),
+                    draining: false,
+                    outbound,
+                },
+            );
+        }
+
+        let reserved = RegistryDispatcher::new(registry.clone())
+            .reserve(vec![QueueReservation {
+                queue_name: "email".into(),
+                count: 1,
+            }])
+            .await
+            .expect("reserve succeeds");
+
+        assert_eq!(reserved.len(), 1);
+        let workers = registry.0.lock().await;
+        assert_eq!(
+            workers.get(&idle_id).expect("idle worker").reserved_slots,
+            1
+        );
+        assert_eq!(
+            workers.get(&busy_id).expect("busy worker").reserved_slots,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn drain_ack_follows_a_dispatch_queued_before_drain() {
         let (outbound, mut inbound) = mpsc::unbounded_channel();
         let worker_id = Uuid::new_v4();
@@ -816,10 +1034,12 @@ mod tests {
             worker_id,
             WorkerState {
                 queue_name: "email".into(),
+                capacity_slots: 1,
                 running_jobs: 0,
                 free_slots: 1,
                 last_activity: Instant::now(),
                 reserved_slots: 1,
+                in_flight_dispatches: HashSet::new(),
                 draining: false,
                 outbound,
             },
@@ -843,6 +1063,18 @@ mod tests {
             dispatch_frame.frame.payload,
             WorkerMessage::JobDispatch { job_id: 9, .. }
         ));
+        let worker = registry
+            .0
+            .lock()
+            .await
+            .get(&worker_id)
+            .expect("worker exists")
+            .clone();
+        assert_eq!(worker.reserved_slots, 0);
+        assert_eq!(
+            worker.in_flight_dispatches,
+            HashSet::from(["dispatch-9".into()])
+        );
 
         begin_drain(
             registry
