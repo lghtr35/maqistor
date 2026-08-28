@@ -78,9 +78,15 @@ pub trait DurableStore: Send + Sync {
         name: &str,
     ) -> impl Future<Output = Result<Option<JobQueue>, StoreError>> + Send;
     fn list_queues(&self) -> impl Future<Output = Result<Vec<JobQueue>, StoreError>> + Send;
-    fn enqueue(&self, job: AcceptedJob) -> impl Future<Output = Result<AcceptedJob, StoreError>> + Send;
+    fn enqueue(
+        &self,
+        job: AcceptedJob,
+    ) -> impl Future<Output = Result<AcceptedJob, StoreError>> + Send;
     fn get_job(&self, job_id: i64) -> impl Future<Output = Result<Job, StoreError>> + Send;
-    fn status(&self, job_id: i64) -> impl Future<Output = Result<ExecutionStatus, StoreError>> + Send;
+    fn status(
+        &self,
+        job_id: i64,
+    ) -> impl Future<Output = Result<ExecutionStatus, StoreError>> + Send;
     fn claim_next(
         &self,
         queue_name: &str,

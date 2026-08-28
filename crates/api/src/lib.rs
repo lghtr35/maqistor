@@ -103,7 +103,7 @@ mod tests {
 
     use axum::{body::Body, http::Request};
     use maqistor_dispatcher::{RegistryDispatcher, WorkerRegistry};
-    use maqistor_engine::{AcceptedJob, Job, JobQueue, ExecutionStatus, StoreError};
+    use maqistor_engine::{AcceptedJob, ExecutionStatus, Job, JobQueue, StoreError};
     use tower::ServiceExt;
 
     use super::*;

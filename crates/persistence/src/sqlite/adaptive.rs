@@ -79,11 +79,17 @@ impl ResultsLaneController {
             (false, false) => return None,
             (true, false) => {
                 self.preferred_turns = 0;
-                return Some((ResultsLane::Dispatch, ResultsLaneSelectionReason::OnlyActive));
+                return Some((
+                    ResultsLane::Dispatch,
+                    ResultsLaneSelectionReason::OnlyActive,
+                ));
             }
             (false, true) => {
                 self.preferred_turns = 0;
-                return Some((ResultsLane::Completion, ResultsLaneSelectionReason::OnlyActive));
+                return Some((
+                    ResultsLane::Completion,
+                    ResultsLaneSelectionReason::OnlyActive,
+                ));
             }
             (true, true) => {}
         }

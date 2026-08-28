@@ -41,7 +41,10 @@ pub(crate) struct RwConnection {
 }
 
 impl RwConnection {
-    pub(crate) fn open(path: impl AsRef<Path>, durability: DurabilityMode) -> Result<Self, StoreError> {
+    pub(crate) fn open(
+        path: impl AsRef<Path>,
+        durability: DurabilityMode,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if let Some(parent) = path
             .parent()
@@ -338,13 +341,7 @@ impl ReadPool {
 
     pub(crate) fn open_results(path: &Path) -> Result<Self, StoreError> {
         let execution_sql = format!("{EXECUTION_SELECT} WHERE job_id = ?1");
-        Self::open_with_sql(
-            path,
-            "",
-            Box::leak(execution_sql.into_boxed_str()),
-            "",
-            "",
-        )
+        Self::open_with_sql(path, "", Box::leak(execution_sql.into_boxed_str()), "", "")
     }
 
     fn open_with_sql(
@@ -398,10 +395,7 @@ impl ReadPool {
         .map_err(|err| StoreError::Internal(err.to_string()))?
     }
 
-    pub(crate) async fn execution(
-        &self,
-        job_id: i64,
-    ) -> Result<Option<Execution>, StoreError> {
+    pub(crate) async fn execution(&self, job_id: i64) -> Result<Option<Execution>, StoreError> {
         if self.execution_sql.is_empty() {
             return Ok(None);
         }

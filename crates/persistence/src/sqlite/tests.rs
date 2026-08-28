@@ -1,8 +1,10 @@
-﻿use std::path::Path;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::*;
-use maqistor_engine::{AcceptedJob, DurableStore, Ewma, JobOutcome, JobQueue, ExecutionStatus, StoreError};
+use maqistor_engine::{
+    AcceptedJob, DurableStore, Ewma, ExecutionStatus, JobOutcome, JobQueue, StoreError,
+};
 use uuid::Uuid;
 
 fn cleanup_store(path: &Path) {
@@ -57,10 +59,7 @@ async fn claim_and_recover_stale_lease() {
     let store = SqliteStore::open(&path).expect("open store");
     let mut queue = JobQueue::new("email");
     queue.timeout_secs = 30;
-    store
-        .upsert_queue(queue)
-        .await
-        .expect("upsert queue");
+    store.upsert_queue(queue).await.expect("upsert queue");
     let job = store
         .enqueue(AcceptedJob::new("email", vec![]))
         .await
@@ -151,7 +150,10 @@ async fn fifo_claims_increment_counts_and_fence_results() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(execution_rows, 1, "execution must stay 1:1 with job across retries");
+    assert_eq!(
+        execution_rows, 1,
+        "execution must stay 1:1 with job across retries"
+    );
 
     let terminal = store
         .complete(
@@ -206,15 +208,22 @@ async fn worker_result_completion_is_fenced_and_lightweight() {
     let claimed = store.claim_next("email").await.unwrap().unwrap();
     let dispatch_id = claimed.dispatch_id.as_deref().unwrap();
 
-    assert!(!store
-        .complete_worker_result(job.id, dispatch_id, JobOutcome::Succeeded(vec![]))
-        .await
-        .unwrap());
-    assert!(!store
-        .complete_worker_result(job.id, dispatch_id, JobOutcome::Succeeded(vec![]))
-        .await
-        .unwrap());
-    assert_eq!(store.get_job(job.id).await.unwrap().status, ExecutionStatus::Completed);
+    assert!(
+        !store
+            .complete_worker_result(job.id, dispatch_id, JobOutcome::Succeeded(vec![]))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .complete_worker_result(job.id, dispatch_id, JobOutcome::Succeeded(vec![]))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.get_job(job.id).await.unwrap().status,
+        ExecutionStatus::Completed
+    );
 }
 
 #[tokio::test]
@@ -411,14 +420,11 @@ async fn claim_preempts_an_open_ingest_batch() {
         async move { store.enqueue(AcceptedJob::new("email", vec![])).await }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let claimed = tokio::time::timeout(
-        Duration::from_millis(100),
-        store.claim_next("email"),
-    )
-    .await
-    .expect("claim must preempt ingest collection instead of waiting for the 500ms deadline")
-    .unwrap()
-    .unwrap();
+    let claimed = tokio::time::timeout(Duration::from_millis(100), store.claim_next("email"))
+        .await
+        .expect("claim must preempt ingest collection instead of waiting for the 500ms deadline")
+        .unwrap()
+        .unwrap();
     assert_eq!(claimed.status, ExecutionStatus::Running);
     enqueue.await.unwrap().unwrap();
 }
@@ -514,7 +520,9 @@ async fn completion_batches_fill_under_mixed_ingest() {
                 .await
         }));
         tokio::spawn(async move {
-            let _ = enqueue_store.enqueue(AcceptedJob::new("email", vec![9])).await;
+            let _ = enqueue_store
+                .enqueue(AcceptedJob::new("email", vec![9]))
+                .await;
         });
     }
 
@@ -1024,8 +1032,5 @@ fn predicted_fill_time_extends_wait_inside_configured_caps() {
         controller.adjust_batch_wait();
     }
     assert!(controller.batch_wait > Duration::from_millis(20));
-    assert!(
-        controller.batch_wait
-            <= controller_options().enqueue.batch_wait_max
-    );
+    assert!(controller.batch_wait <= controller_options().enqueue.batch_wait_max);
 }

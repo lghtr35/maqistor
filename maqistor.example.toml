@@ -78,3 +78,8 @@ timeout_secs = 60
 # env_file = "./workers/email.env"
 # [queues.managed_config.env_vars]
 # MAQISTOR_WORKER_CONCURRENCY = "16"
+# Bind mounts only; host source must exist. Relative paths are resolved from the process cwd.
+# [[queues.managed_config.mounts]]
+# source = "./certs"
+# target = "/certs"
+# read_only = true

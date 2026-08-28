@@ -66,7 +66,9 @@ pub enum JobResult {
         #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
     },
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 pub type WireFrame = ProtocolFrame<WorkerMessage>;

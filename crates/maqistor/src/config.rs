@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    time::Duration,
+};
 
 use chrono::{DateTime, FixedOffset, NaiveTime, Utc};
 use humantime::parse_duration;
@@ -267,11 +272,33 @@ impl QueueConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ContainerMountConfig {
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl ContainerMountConfig {
+    pub fn to_dispatcher_type(&self) -> anyhow::Result<maqistor_dispatcher::ContainerMount> {
+        let source = fs::canonicalize(&self.source)
+            .map_err(|err| anyhow::anyhow!("managed mount source {:?}: {err}", self.source))?;
+        Ok(maqistor_dispatcher::ContainerMount {
+            source: source.to_string_lossy().into_owned(),
+            target: self.target.clone(),
+            read_only: self.read_only,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedConfig {
     pub image: String,
     pub replicas: u32,
     pub env_file: Option<String>,
     pub env_vars: Option<HashMap<String, String>>,
+    pub mounts: Option<Vec<ContainerMountConfig>>,
 }
 
 impl ManagedConfig {
@@ -336,6 +363,7 @@ impl AppConfig {
                 validate_managed_image(&config.image)?;
                 validate_managed_env_file(&config.env_file)?;
                 validate_managed_env_vars(&config.env_vars)?;
+                validate_managed_mounts(&config.mounts)?;
             }
         }
         Ok(())
@@ -460,6 +488,31 @@ fn validate_managed_env_vars(env_vars: &Option<HashMap<String, String>>) -> anyh
             if key.is_empty() || value.is_empty() {
                 anyhow::bail!("managed env vars must be nonempty");
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_mounts(mounts: &Option<Vec<ContainerMountConfig>>) -> anyhow::Result<()> {
+    let Some(mounts) = mounts else {
+        return Ok(());
+    };
+    let mut targets = HashSet::new();
+    for mount in mounts {
+        if mount.source.trim().is_empty() || mount.target.trim().is_empty() {
+            anyhow::bail!("managed mount source and target must be nonempty");
+        }
+        if !mount.target.starts_with('/') {
+            anyhow::bail!(
+                "managed mount target {:?} must be an absolute container path",
+                mount.target
+            );
+        }
+        if !Path::new(&mount.source).exists() {
+            anyhow::bail!("managed mount source {:?} does not exist", mount.source);
+        }
+        if !targets.insert(mount.target.as_str()) {
+            anyhow::bail!("managed mount target {:?} is duplicated", mount.target);
         }
     }
     Ok(())
@@ -691,5 +744,36 @@ mod tests {
         .expect("parse");
         assert!(managed.has_managed_queues());
         assert!(managed.validate().is_ok());
+    }
+
+    #[test]
+    fn managed_mounts_require_existing_host_source() {
+        let missing: AppConfig = toml::from_str(&format!(
+            "{TLS}[[queues]]\nname = 'email'\nmax_retries = 3\ntimeout_secs = 60\n[queues.managed_config]\nimage = 'ghcr.io/example/email:1.0.0'\nreplicas = 1\n[[queues.managed_config.mounts]]\nsource = './no-such-certs'\ntarget = '/certs'\n"
+        ))
+        .expect("parse");
+        assert!(missing.validate().is_err());
+    }
+
+    #[test]
+    fn managed_mounts_accept_existing_bind() {
+        let source = std::env::temp_dir();
+        let config: AppConfig = toml::from_str(&format!(
+            "{TLS}[[queues]]\nname = 'email'\nmax_retries = 3\ntimeout_secs = 60\n[queues.managed_config]\nimage = 'ghcr.io/example/email:1.0.0'\nreplicas = 1\n[[queues.managed_config.mounts]]\nsource = '{}'\ntarget = '/certs'\nread_only = true\n",
+            source.display()
+        ))
+        .expect("parse");
+        assert!(config.validate().is_ok());
+        let mount = &config.queues[0]
+            .managed_config
+            .as_ref()
+            .unwrap()
+            .mounts
+            .as_ref()
+            .unwrap()[0];
+        let mapped = mount.to_dispatcher_type().expect("canonicalize");
+        assert!(mapped.read_only);
+        assert_eq!(mapped.target, "/certs");
+        assert!(std::path::Path::new(&mapped.source).is_absolute());
     }
 }

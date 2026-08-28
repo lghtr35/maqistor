@@ -12,7 +12,7 @@ use bollard::{
     API_DEFAULT_VERSION, Docker,
     container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions},
     image::CreateImageOptions,
-    models::{HostConfig, RestartPolicy, RestartPolicyNameEnum},
+    models::{HostConfig, Mount, MountPoint, MountTypeEnum, RestartPolicy, RestartPolicyNameEnum},
 };
 use futures_util::StreamExt;
 use maqistor_engine::{
@@ -197,12 +197,46 @@ impl Default for WorkerRegistry {
         Self(Arc::new(Mutex::new(HashMap::new())), events)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerMount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+impl ContainerMount {
+    pub fn from_inspect(mount: &MountPoint) -> Self {
+        Self {
+            source: mount.source.clone().unwrap_or_default(),
+            target: mount.destination.clone().unwrap_or_default(),
+            read_only: !mount.rw.unwrap_or(true),
+        }
+    }
+
+    pub fn to_docker_mount(&self) -> Mount {
+        Mount {
+            target: Some(self.target.clone()),
+            source: Some(self.source.clone()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(self.read_only),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&MountPoint> for ContainerMount {
+    fn from(mount: &MountPoint) -> Self {
+        Self::from_inspect(mount)
+    }
+}
 #[derive(Debug, Clone)]
 pub struct ManagedQueue {
     pub name: String,
     pub image: String,
     pub replicas: u32,
     pub env: Vec<String>,
+    pub mounts: Vec<ContainerMount>,
 }
 
 /// How to reach the Docker daemon used for managed worker containers.
@@ -329,6 +363,7 @@ impl DockerWorkerSupervisor {
         let name = container_name(&queue.name, ordinal);
         let desired_image = self.resolve_image_id(&queue.image).await?;
         let desired_env = &queue.env;
+        let desired_mounts = &queue.mounts;
         if let Ok(container) = self.docker.inspect_container(&name, None).await {
             let mut need_update = false;
             if container.image.as_deref() != Some(desired_image.as_str()) {
@@ -342,6 +377,20 @@ impl DockerWorkerSupervisor {
             if !desired_env
                 .iter()
                 .all(|wanted| current_env.iter().any(|have| have == wanted))
+            {
+                need_update = true;
+            }
+
+            let current_mounts: Vec<ContainerMount> = container
+                .mounts
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(ContainerMount::from)
+                .collect();
+            if !desired_mounts
+                .iter()
+                .all(|wanted| current_mounts.contains(wanted))
             {
                 need_update = true;
             }
@@ -388,6 +437,13 @@ impl DockerWorkerSupervisor {
                     name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                     maximum_retry_count: None,
                 }),
+                mounts: Some(
+                    queue
+                        .mounts
+                        .iter()
+                        .map(ContainerMount::to_docker_mount)
+                        .collect(),
+                ),
                 ..Default::default()
             }),
             ..Default::default()
@@ -678,6 +734,29 @@ async fn handle_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_mount_maps_inspect_source_target_and_read_only() {
+        let mount = MountPoint {
+            source: Some("/host/certs".into()),
+            destination: Some("/certs".into()),
+            rw: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            ContainerMount::from(&mount),
+            ContainerMount {
+                source: "/host/certs".into(),
+                target: "/certs".into(),
+                read_only: true,
+            }
+        );
+        let docker = ContainerMount::from(&mount).to_docker_mount();
+        assert_eq!(docker.typ, Some(MountTypeEnum::BIND));
+        assert_eq!(docker.read_only, Some(true));
+        assert_eq!(docker.source.as_deref(), Some("/host/certs"));
+        assert_eq!(docker.target.as_deref(), Some("/certs"));
+    }
 
     #[test]
     fn worker_result_replaces_reservation_estimate_with_capacity_snapshot() {

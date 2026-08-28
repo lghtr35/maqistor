@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use maqistor_engine::{AcceptedJob, DurableStore, Job, JobOutcome, JobQueue, ExecutionStatus, StoreError};
-
-use super::options::DurabilityMode;
-use super::common::{
-    default_results_path, heal_orphan_claims, merge_job, unix_now, RwConnection,
+use maqistor_engine::{
+    AcceptedJob, DurableStore, ExecutionStatus, Job, JobOutcome, JobQueue, StoreError,
 };
+
+use super::common::{RwConnection, default_results_path, heal_orphan_claims, merge_job, unix_now};
 use super::ingest::{IngestClaimed, IngestHandle};
+use super::options::DurabilityMode;
 use super::options::SqliteWriteOptions;
 use super::results::{CompletionDisposition, DispatchInsert, DispatchedExecution, ResultsHandle};
 
@@ -41,7 +41,7 @@ impl SqliteStore {
         let ingest = IngestHandle::open(ingest_path.clone(), &options)?;
         let results = ResultsHandle::open(results_path, &options)?;
         Self::heal_on_open(&ingest_path, &ingest, &results)?;
-        Ok(Self { ingest, results})
+        Ok(Self { ingest, results })
     }
 
     fn heal_on_open(
@@ -63,10 +63,7 @@ impl SqliteStore {
         Ok(merge_job(accepted, execution))
     }
 
-    fn job_from_claimed(
-        claimed: &IngestClaimed,
-        dispatched: &DispatchedExecution,
-    ) -> Job {
+    fn job_from_claimed(claimed: &IngestClaimed, dispatched: &DispatchedExecution) -> Job {
         Job {
             id: claimed.id,
             name: claimed.name.clone(),
@@ -94,8 +91,8 @@ impl SqliteStore {
         let claimed_at = unix_now();
         let mut dispatch_rows = Vec::with_capacity(claimed.len());
         for row in &claimed {
-            let lease_expires_at = claimed_at
-                .saturating_add((row.timeout_secs as i64).saturating_mul(1000));
+            let lease_expires_at =
+                claimed_at.saturating_add((row.timeout_secs as i64).saturating_mul(1000));
             dispatch_rows.push(DispatchInsert {
                 job_id: row.id,
                 queue_name: row.name.clone(),
@@ -169,13 +166,8 @@ impl DurableStore for SqliteStore {
         Ok(self.claim_batch(queue_name, 1).await?.pop())
     }
 
-    async fn claim_batch(
-        &self,
-        queue_name: &str,
-        limit: usize,
-    ) -> Result<Vec<Job>, StoreError> {
-        self.claim_batch_inner(queue_name, limit)
-            .await
+    async fn claim_batch(&self, queue_name: &str, limit: usize) -> Result<Vec<Job>, StoreError> {
+        self.claim_batch_inner(queue_name, limit).await
     }
 
     async fn complete(
@@ -207,7 +199,6 @@ impl DurableStore for SqliteStore {
         }
         Ok(false)
     }
-
 
     async fn release_claim(&self, job_id: i64, dispatch_id: &str) -> Result<bool, StoreError> {
         let accepted = self.ingest.accepted_row(job_id).await?;

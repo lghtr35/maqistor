@@ -4,9 +4,7 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::{
-    Connection, ToSql, TransactionBehavior, params, params_from_iter,
-};
+use rusqlite::{Connection, ToSql, TransactionBehavior, params, params_from_iter};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
@@ -21,12 +19,7 @@ use super::options::{DurabilityMode, SqliteWriteOptions};
 
 const CHANNEL_CAPACITY: usize = 1024;
 
-const JOBS_INSERT_COLUMNS: &[&str] = &[
-    "queue_name",
-    "payload",
-    "created_at",
-    "updated_at",
-];
+const JOBS_INSERT_COLUMNS: &[&str] = &["queue_name", "payload", "created_at", "updated_at"];
 
 #[derive(Debug, Clone)]
 pub(crate) struct IngestClaimed {
@@ -252,8 +245,7 @@ impl IngestConn {
         let now = unix_now();
         let mut claimed = Vec::with_capacity(pending.len());
         for chunk in pending.chunks(ROWS_PER_STATEMENT) {
-            let dispatch_ids: Vec<String> =
-                (0..chunk.len()).map(|_| new_dispatch_id()).collect();
+            let dispatch_ids: Vec<String> = (0..chunk.len()).map(|_| new_dispatch_id()).collect();
             let mut values: Vec<&dyn ToSql> = Vec::with_capacity(chunk.len() * 3);
             for (row, dispatch_id) in chunk.iter().zip(dispatch_ids.iter()) {
                 values.push(&row.id);
@@ -269,11 +261,11 @@ impl IngestConn {
                 "accepted_jobs.id = v.id AND accepted_jobs.dispatch_id IS NULL",
                 Some("accepted_jobs.id, accepted_jobs.dispatch_id"),
             );
-            let updated = bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let by_id: std::collections::HashMap<i64, String> =
-                updated.into_iter().collect();
+            let updated =
+                bulk::query_pairs_cached_tx(&tx, &sql, params_from_iter(values), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+            let by_id: std::collections::HashMap<i64, String> = updated.into_iter().collect();
             for row in chunk {
                 let Some(dispatch_id) = by_id.get(&row.id) else {
                     continue;
@@ -330,7 +322,8 @@ impl IngestConn {
             .conn
             .prepare("DELETE FROM accepted_jobs WHERE created_at < ?1")
             .map_err(|err| StoreError::Internal(err.to_string()))?;
-        let rows_affected = statement.execute(params![cutoff])
+        let rows_affected = statement
+            .execute(params![cutoff])
             .map_err(|err| StoreError::Internal(err.to_string()))?;
         Ok(rows_affected)
     }
@@ -460,7 +453,8 @@ impl IngestHandle {
     }
 
     pub(crate) async fn enqueue(&self, job: AcceptedJob) -> Result<AcceptedJob, StoreError> {
-        self.call(|reply| IngestRequest::Enqueue { job, reply }).await
+        self.call(|reply| IngestRequest::Enqueue { job, reply })
+            .await
     }
 
     pub(crate) async fn claim_batch(
@@ -487,7 +481,6 @@ impl IngestHandle {
         .await
     }
 
-
     pub(crate) async fn accepted_row(&self, job_id: i64) -> Result<AcceptedJob, StoreError> {
         self.reads.accepted_job(job_id).await
     }
@@ -502,8 +495,7 @@ impl IngestHandle {
     }
 
     pub(crate) async fn vacuum(&self) -> Result<(), StoreError> {
-        self.call(|reply| IngestRequest::Vacuum { reply })
-            .await
+        self.call(|reply| IngestRequest::Vacuum { reply }).await
     }
 }
 
@@ -524,8 +516,10 @@ impl IngestQueues {
                 self.ingest.push_back(PendingEnqueue { job, reply });
             }
             IngestRequest::ClaimBatch { .. } => self.claim.push_back(request),
-            IngestRequest::UpsertQueue { .. } | IngestRequest::Repend { .. } | 
-            IngestRequest::CleanupExpiredRecords { .. } | IngestRequest::Vacuum { .. } => {
+            IngestRequest::UpsertQueue { .. }
+            | IngestRequest::Repend { .. }
+            | IngestRequest::CleanupExpiredRecords { .. }
+            | IngestRequest::Vacuum { .. } => {
                 self.meta.push_back(request);
             }
         }
@@ -567,10 +561,22 @@ async fn ingest_writer_loop(
             continue;
         }
         if !queues.ingest.is_empty() {
-            let disconnected = run_ingest_turn(&mut conn, &mut rx, &mut queues, &mut controller, &queue_names)
-                .await;
+            let disconnected = run_ingest_turn(
+                &mut conn,
+                &mut rx,
+                &mut queues,
+                &mut controller,
+                &queue_names,
+            )
+            .await;
             if disconnected {
-                flush_ingest(&mut conn, &mut queues, &mut controller, &queue_names, rx.len());
+                flush_ingest(
+                    &mut conn,
+                    &mut queues,
+                    &mut controller,
+                    &queue_names,
+                    rx.len(),
+                );
                 while let Some(request) = queues.meta.pop_front() {
                     conn.handle(request, &mut queue_names);
                 }
@@ -628,9 +634,9 @@ async fn run_ingest_turn(
             Ok(Some(request)) => {
                 let preempt = matches!(
                     request,
-            IngestRequest::ClaimBatch { .. }
-                | IngestRequest::UpsertQueue { .. }
-                | IngestRequest::Repend { .. }
+                    IngestRequest::ClaimBatch { .. }
+                        | IngestRequest::UpsertQueue { .. }
+                        | IngestRequest::Repend { .. }
                 );
                 queues.push(request);
                 if preempt {
@@ -650,7 +656,15 @@ async fn run_ingest_turn(
     } else {
         FlushReason::Timeout
     };
-    flush_pending(conn, &mut pending, &mut batch_deadline, controller, queue_names, reason, rx.len());
+    flush_pending(
+        conn,
+        &mut pending,
+        &mut batch_deadline,
+        controller,
+        queue_names,
+        reason,
+        rx.len(),
+    );
     disconnected
 }
 

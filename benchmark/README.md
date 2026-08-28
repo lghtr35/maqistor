@@ -28,7 +28,7 @@ durable batch is counted rather than aborted by the load generator.
 
 ```bash
 cargo install oha
-# ensure ~/.cargo/bin (or %USERPROFILE%\.cargo\bin) is on PATH
+# ensure ~/.cargo/bin is on PATH
 ```
 
 ### Managed no-op worker
@@ -43,7 +43,8 @@ docker build -f benchmark/noop-worker/Dockerfile -t maqistor-benchmark-noop-work
 ```
 
 The worker connects to `host.docker.internal:17829` (Docker Desktop) and
-discards each JSON payload before returning an empty successful result. The
+discards each JSON payload before returning an empty successful result. Maqistor
+bind-mounts `benchmark/certs` into `/certs` on the managed replicas. The
 certificate directory is ignored by Git.
 
 `--mode full` and `--mode drain` require this worker so jobs drain and complete.
@@ -82,23 +83,23 @@ free worker slots from `reserve`, capped by those ceilings.
 
 ## Runner (`run.py`)
 
-```powershell
+```bash
 # Six closed and six open points, 30s each, 5s settle between points.
-python benchmark\run.py
+python benchmark/run.py
 
 # Closed-loop ceiling only.
-python benchmark\run.py --mode closed
+python benchmark/run.py --mode closed
 
 # Open-loop region with generous client concurrency.
-python benchmark\run.py --mode open --open-connections 1000 `
+python benchmark/run.py --mode open --open-connections 1000 \
   --open-qps 8000,9000,10000,11000,12000,14000
 
 # Full cycle: offer QPS, drain the bench queue, report cycle delay from DB.
-python benchmark\run.py --mode full --open-qps 1000,2000 --duration 10 `
+python benchmark/run.py --mode full --open-qps 1000,2000 --duration 10 \
   --settle-seconds 5
 
 # Drain only: seed jobs in one SQLite transaction (excluded from timing), then drain them.
-python benchmark\run.py --mode drain --drain-jobs 100000 `
+python benchmark/run.py --mode drain --drain-jobs 100000 \
   --drain-timeout-seconds 120
 ```
 
@@ -158,14 +159,12 @@ backlog.
 
 ## Manual oha (same methodology)
 
-```powershell
+```bash
 oha -c 100 -z 90s --latency-correction http://127.0.0.1:18081/health
 
-oha -c 100 -z 90s -m POST -H "Content-Type: application/json" `
-  -D benchmark\oha-job.json --latency-correction http://127.0.0.1:18081/jobs
+oha -c 100 -z 90s -m POST -H "Content-Type: application/json" \
+  -D benchmark/oha-job.json --latency-correction http://127.0.0.1:18081/jobs
 ```
-
-On Windows, prefer `-D` file body — inline `-d` JSON is often mangled by PowerShell.
 
 ## Notes
 
